@@ -1,0 +1,16 @@
+path: ../datasets/snooker_v2  # New dataset root dir
+train: images/train       # train images 
+val: images/val           # val images 
+test: images/test         # test images
+
+# Classes
+nc: 8
+names: ['black-ball', 'blue-ball', 'brown-ball', 'green-ball', 'pink-ball', 'red-ball', 'white-ball', 'yellow-ball']
+
+
+roboflow:
+  workspace: fyp-gymcr
+  project: snooker-ball-detection-rnhxo-ibtop
+  version: 1
+  license: CC BY 4.0
+  url: https://app.roboflow.com/fyp-gymcr/snooker-ball-detection-rnhxo-ibtop/1

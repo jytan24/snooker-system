@@ -1,0 +1,29 @@
+name: snooker_ball_detector
+description: A new Flutter project.
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  image_picker: ^1.0.4
+  http: ^1.1.0
+  path: ^1.8.3
+  video_player: ^2.11.0
+  path_provider: ^2.1.5
+  chewie: ^1.13.0
+  video_player_win: ^3.2.2
+  device_preview: ^1.3.1
+  camera: ^0.12.0
+  camera_windows: ^0.2.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^2.0.0
+
+flutter:
+  uses-material-design: true
