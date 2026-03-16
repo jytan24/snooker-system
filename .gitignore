@@ -1,0 +1,4 @@
+*.pt
+*.zip
+runs/
+__pycache__/

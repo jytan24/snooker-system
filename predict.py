@@ -1,23 +1,29 @@
 from ultralytics import YOLO
 import os
-import glob
+import torch
+
+
+def get_compute_device():
+    """Return (torch_device, device_arg, backend_name) with DirectML->CPU fallback."""
+    try:
+        import torch_directml  # Optional dependency on Windows
+
+        dml_device = torch_directml.device()
+        # Sanity check that tensor allocation works on this device
+        _ = torch.zeros((1,), device=dml_device)
+        print(f"Using DirectML device: {dml_device}")
+        return dml_device, str(dml_device), 'directml'
+    except Exception as e:
+        cpu_device = torch.device('cpu')
+        print(f"DirectML not available. Falling back to CPU. Reason: {e}")
+        return cpu_device, 'cpu', 'cpu'
 
 def main():
-    # 1. Define Paths
-    # Update this path if your model is stored elsewhere
+    """Load a trained YOLO model and run inference on images in new_test_images/."""
+    device, device_arg, backend = get_compute_device()
+
     model_path = 'runs/detect/snooker_project/yolo11_snooker_v2/weights/best.pt'
-    
-    # Define an image to test. 
-    # Use the first image found in the NEW folder
-    # Please put your images in the 'new_test_images' folder!
     new_folder_path = 'new_test_images'
-    # test_images_files = glob.glob(os.path.join(new_folder_path, '*.jpg'))
-    
-    # if test_images_files:
-    #     source_image = test_images_files[0] # Pick the first available image
-    # else:
-    #     print(f"No images found in {new_folder_path}. Please add a .jpg file there.")
-    #     return
 
     print(f"Loading model from: {model_path}")
     print(f"Testing on images in: {new_folder_path}")
@@ -26,13 +32,28 @@ def main():
         print("Error: Model weights not found. Check the path.")
         return
 
-    # 2. Load the trained model
     model = YOLO(model_path)
+    try:
+        model.model.to(device)
+    except Exception as e:
+        print(f"Warning: could not move model tensors to {device}. Reason: {e}")
+        device = torch.device('cpu')
+        device_arg = 'cpu'
+        backend = 'cpu'
+        model.model.to(device)
 
-    # 3. Run Inference (Prediction)
-    # save=True will save the image with drawn boxes to 'runs/detect/predict'
-    # conf=0.25 is the confidence threshold (25%)
-    results = model.predict(source=new_folder_path, save=True, conf=0.25)
+    print(f"Running prediction on backend: {backend}")
+    try:
+        results = model.predict(source=new_folder_path, save=True, conf=0.25, device=device_arg)
+    except Exception as pred_err:
+        if backend == 'directml':
+            print(f"DirectML inference failed ({pred_err}). Retrying on CPU for safety...")
+            device = torch.device('cpu')
+            device_arg = 'cpu'
+            model.model.to(device)
+            results = model.predict(source=new_folder_path, save=True, conf=0.25, device=device_arg)
+        else:
+            raise
 
     if results:
         print("\nPrediction complete!")

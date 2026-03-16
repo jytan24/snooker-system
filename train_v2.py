@@ -1,36 +1,74 @@
 from ultralytics import YOLO
+import torch
+
+
+def get_compute_device():
+    """Return (torch_device, device_arg, backend_name) with DirectML->CPU fallback."""
+    try:
+        import torch_directml  # Optional dependency on Windows
+
+        dml_device = torch_directml.device()
+        # Sanity check that tensor allocation works on this device
+        _ = torch.zeros((1,), device=dml_device)
+        print(f"Using DirectML device: {dml_device}")
+        return dml_device, str(dml_device), 'directml'
+    except Exception as e:
+        cpu_device = torch.device('cpu')
+        print(f"DirectML not available. Falling back to CPU. Reason: {e}")
+        return cpu_device, 'cpu', 'cpu'
 
 def main():
-    # 1. Load the YOLOv11 model (Small)
-    model = YOLO('yolo11s.pt')
+    """Train YOLOv11s on the snooker_v2 dataset, validate, test, and export to ONNX."""
+    device, device_arg, backend = get_compute_device()
 
-    print("Starting training for V2 dataset...")
-    
-    # 2. Train the model
-    # Saving to a new project folder 'snooker_project' with name 'yolo11_snooker_v2'
+    model = YOLO('yolo11s.pt')
     try:
-        results = model.train(
-            data='data_v2.yaml',    # Pointing to the NEW yaml
-            epochs=70,
-            imgsz=960,              # Standard size, change to 960 or 1280 if needed
-            device='cpu',           # Change to '0' if using GPU
-            project='snooker_project',
-            name='yolo11_snooker_v2', # New run name
-              
-        )
+        model.model.to(device)
+    except Exception as e:
+        print(f"Warning: could not move model tensors to {device}. Reason: {e}")
+        device = torch.device('cpu')
+        device_arg = 'cpu'
+        backend = 'cpu'
+        model.model.to(device)
+
+    print(f"Starting training for V2 dataset on backend: {backend}...")
+    
+    try:
+        try:
+            results = model.train(
+                data='data_v2.yaml',
+                epochs=70,
+                imgsz=960,
+                device=device_arg,
+                project='snooker_project',
+                name='yolo11_snooker_v2',
+            )
+        except Exception as train_err:
+            if backend == 'directml':
+                print(f"DirectML training failed ({train_err}). Retrying on CPU for safety...")
+                device = torch.device('cpu')
+                device_arg = 'cpu'
+                model.model.to(device)
+                results = model.train(
+                    data='data_v2.yaml',
+                    epochs=70,
+                    imgsz=960,
+                    device=device_arg,
+                    project='snooker_project',
+                    name='yolo11_snooker_v2',
+                )
+            else:
+                raise
         print("Training complete.")
         
-        # 3. Validate (on 'val' set)
         print("Starting validation...")
         metrics = model.val()
         print(f"mAP50-95: {metrics.box.map}")
 
-        # 4. Test (on 'test' set)
         print("Starting testing on unseen data...")
         test_results = model.val(split='test')
         print(f"Test Set mAP50-95: {test_results.box.map}")
 
-        # 5. Export
         model.export(format='onnx')
 
     except Exception as e:
