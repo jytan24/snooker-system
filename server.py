@@ -43,6 +43,9 @@ import uuid
 import time
 import json
 import threading
+import subprocess
+import shutil
+import re
 import onnxruntime as ort
 import logging
 
@@ -74,6 +77,86 @@ jobs = {}
 
 # When True, processed job returns the original uploaded video (no annotation overlays).
 PRESERVE_OUTPUT_VIDEO_QUALITY = False
+
+TEMP_VIDEO_DIR = os.path.abspath('temp_videos')
+PROCESSED_VIDEO_DIR = os.path.abspath('processed_videos')
+_processed_name_lock = threading.Lock()
+
+
+def _allocate_processed_output_path():
+    """Return the next output path: processed_videos/processed_vidN.mp4."""
+    os.makedirs(PROCESSED_VIDEO_DIR, exist_ok=True)
+    max_idx = 0
+    for name in os.listdir(PROCESSED_VIDEO_DIR):
+        m = re.match(r'^processed_vid(\d+)\.mp4$', name)
+        if m:
+            max_idx = max(max_idx, int(m.group(1)))
+    next_idx = max_idx + 1
+    return os.path.join(PROCESSED_VIDEO_DIR, f'processed_vid{next_idx}.mp4')
+
+
+def _allocate_temp_input_path(suffix):
+    """Return a temp input path inside temp_videos/ with the provided suffix."""
+    os.makedirs(TEMP_VIDEO_DIR, exist_ok=True)
+    return os.path.join(TEMP_VIDEO_DIR, f"{uuid.uuid4()}_{suffix}")
+
+
+def _make_playback_compatible_video(source_path, dest_path):
+    """Transcode to a seek-friendly H.264 MP4 for Android/Flutter playback.
+
+    Returns True on success, False otherwise.
+    """
+    try:
+        if not os.path.exists(source_path) or os.path.getsize(source_path) <= 0:
+            return False
+
+        ffmpeg_bin = shutil.which('ffmpeg')
+        if not ffmpeg_bin:
+            try:
+                import imageio_ffmpeg
+
+                ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
+                print(f"Using bundled ffmpeg from imageio-ffmpeg: {ffmpeg_bin}")
+            except Exception:
+                ffmpeg_bin = None
+
+        if not ffmpeg_bin:
+            print('[WARN] ffmpeg not found in PATH and bundled ffmpeg unavailable; skip playback transcode.')
+            return False
+
+        cmd = [
+            ffmpeg_bin,
+            '-y',
+            '-i', source_path,
+            '-c:v', 'libx264',
+            '-preset', 'veryfast',
+            '-crf', '22',
+            '-pix_fmt', 'yuv420p',
+            '-movflags', '+faststart',
+            '-an',
+            dest_path,
+        ]
+
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+
+        if proc.returncode != 0:
+            print(f"[WARN] ffmpeg transcode failed ({proc.returncode}): {proc.stderr[-500:]}")
+            return False
+
+        if not os.path.exists(dest_path) or os.path.getsize(dest_path) <= 0:
+            return False
+
+        return True
+    except Exception as e:
+        print(f"[WARN] playback transcode error: {e}")
+        return False
 
 class SnookerGameTracker:
     """Finite-state machine that tracks scores, turns, fouls, and game phase for a snooker match."""
@@ -315,8 +398,6 @@ class SnookerGameTracker:
                             break
 
         return self._result()
-
-
 
 class BallCoordinateTracker:
     """Track snooker balls across frames with unique IDs and motion state.
@@ -635,7 +716,6 @@ class BallCoordinateTracker:
             })
         return out
 
-
 print("Loading model...")
 model_path = 'runs/detect/snooker_project/yolo11_snooker_v2/weights/best.onnx'
 if not os.path.exists(model_path):
@@ -802,6 +882,7 @@ def correct_label_by_hsv(pred_key, hsv_avg, pred_conf=None):
 
     return pred_key
 
+
 @app.route('/frame_detections', methods=['POST'])
 def get_frame_detections():
     """Accept a single video frame and return YOLO detections with a base64-encoded image."""
@@ -809,8 +890,7 @@ def get_frame_detections():
         return jsonify({'error': 'No file uploaded'})
 
     file = request.files['file']
-    unique_id = str(uuid.uuid4())
-    temp_input = os.path.abspath(f"temp_frame_{unique_id}.mp4")
+    temp_input = _allocate_temp_input_path('frame.mp4')
     
     try:
         if not file.filename:
@@ -842,34 +922,50 @@ def get_frame_detections():
              height = new_height
         
         yolo_frame = frame
-
-        results = model(yolo_frame, verbose=False)
         detections = []
-        
-        if results:
-            result = results[0]
-            names = result.names
-            for one_box in result.boxes:
-                x1, y1, x2, y2 = one_box.xyxy[0].tolist()
-                cls_id = int(one_box.cls[0])
-                conf = float(one_box.conf[0])
-                label = names[cls_id]
-                
-                detections.append({
-                    'rect': [x1, y1, x2, y2],
-                    'label': label,
-                    'conf': conf
-                })
-        
-        _, buffer = cv2.imencode('.jpg', frame)
+        inference_warning = None
+
+        try:
+            results = model(yolo_frame, verbose=False)
+            if results:
+                result = results[0]
+                names = result.names
+                for one_box in result.boxes:
+                    x1, y1, x2, y2 = one_box.xyxy[0].tolist()
+                    cls_id = int(one_box.cls[0])
+                    conf = float(one_box.conf[0])
+                    label = names[cls_id]
+
+                    detections.append({
+                        'rect': [x1, y1, x2, y2],
+                        'label': label,
+                        'conf': conf
+                    })
+        except Exception as infer_err:
+            # Keep this endpoint resilient: pocket calibration can proceed
+            # even if detector inference fails for frame 0.
+            inference_warning = str(infer_err)
+            print(f"[WARN] /frame_detections inference failed: {infer_err}")
+
+        ok, buffer = cv2.imencode(
+            '.jpg',
+            frame,
+            [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+        )
+        if not ok:
+            return jsonify({'error': 'Failed to encode frame image'}), 500
         img_str = base64.b64encode(buffer).decode('utf-8')
-        
-        return jsonify({
+
+        payload = {
             'image_base64': img_str,
             'detections': detections,
             'width': width,
             'height': height
-        })
+        }
+        if inference_warning:
+            payload['warning'] = 'Frame returned without detections'
+
+        return jsonify(payload)
 
     except Exception as e:
         if os.path.exists(temp_input):
@@ -883,6 +979,7 @@ def get_frame_detections():
 def process_video_job(job_id, temp_input, temp_output, color_mapping, color_overrides, pocket_points=None):
     """Background worker: run YOLO detection, ball tracking, and game scoring on a full video."""
     try:
+        print(f"Job {job_id}: starting processing worker...")
         jobs[job_id]['status'] = 'processing'
         jobs[job_id]['progress'] = 0
         jobs[job_id]['processed_frames'] = 0
@@ -959,18 +1056,34 @@ def process_video_job(job_id, temp_input, temp_output, color_mapping, color_over
 
         if fps == 0 or np.isnan(fps): fps = 30.0
 
+        print(
+            f"Job {job_id}: video opened "
+            f"({width}x{height}, fps={fps:.2f}, total_frames={total_frames if total_frames > 0 else 'unknown'})"
+        )
+
         out = None
         if not PRESERVE_OUTPUT_VIDEO_QUALITY:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             out = cv2.VideoWriter(temp_output, fourcc, fps, (new_width, new_height))
+            if out is None or not out.isOpened():
+                raise RuntimeError(
+                    f"Failed to open VideoWriter for output: {temp_output} "
+                    f"(fps={fps}, size={new_width}x{new_height})"
+                )
         
         timeline_stats = []
         frame_count = 0
         last_stats = {}
-        # Keep denser timeline samples so Video tab updates several times per second.
-        # Previously it sampled ~1 Hz only, which looked like missing balls during motion.
+        last_logged_action_idx = 0
+        # Keep timeline dense enough for smooth UI updates, but cap points for long videos.
         timeline_sample_fps = min(10.0, fps) if fps > 0 else 10.0
-        timeline_stride = max(1, int(round(fps / timeline_sample_fps))) if fps > 0 else 1
+        base_timeline_stride = max(1, int(round(fps / timeline_sample_fps))) if fps > 0 else 1
+        max_timeline_points = 4000
+        if total_frames > 0:
+            capped_stride = max(1, int(np.ceil(total_frames / float(max_timeline_points))))
+        else:
+            capped_stride = 1
+        timeline_stride = max(base_timeline_stride, capped_stride)
         
         points = {
             'red-ball': 1, 'yellow-ball': 2, 'green-ball': 3,
@@ -1287,7 +1400,18 @@ def process_video_job(job_id, temp_input, temp_output, color_mapping, color_over
                 is_shot_active = any_moving or any_missing_in_zone
                 track_res = tracker.update(current_stats, potted_balls, is_shot_active=is_shot_active, any_moving=any_moving)
 
-                if has_balls or potted_balls:
+                # Print every newly generated game action exactly once.
+                if len(tracker.action_log) > last_logged_action_idx:
+                    for evt in tracker.action_log[last_logged_action_idx:]:
+                        if isinstance(evt, dict):
+                            evt_type = evt.get('type', 'info')
+                            evt_msg = evt.get('msg', '')
+                            print(f"[JOB {job_id}][ACTION:{evt_type}] {evt_msg}")
+                    last_logged_action_idx = len(tracker.action_log)
+
+                timeline_appended_this_frame = False
+
+                if has_balls or potted_balls or track_res.get('history'):
                     # Use smoothed counts for exported video stats (reduces motion-blur flicker)
                     stable_counts = tracker.get_stable_counts()
                     stats_counts = current_stats.copy()
@@ -1341,7 +1465,44 @@ def process_video_job(job_id, temp_input, temp_output, color_mapping, color_over
                     last_stats = current_stats.copy()
                     
                     if frame_count % timeline_stride == 0:
-                        timeline_stats.append(current_stats)
+                        # Keep timeline lightweight for client seek/rewind sync.
+                        timeline_entry = {
+                            'timestamp': current_stats.get('timestamp', 0),
+                            'player1_score': current_stats.get('player1_score', 0),
+                            'player2_score': current_stats.get('player2_score', 0),
+                            'current_player': current_stats.get('current_player', 1),
+                            'potential_score': current_stats.get('potential_score', 0),
+                            'potted_balls': list(current_stats.get('potted_balls', [])),
+                        }
+
+                        for ball_key in points.keys():
+                            timeline_entry[f'p1_potted_{ball_key}'] = current_stats.get(f'p1_potted_{ball_key}', 0)
+                            timeline_entry[f'p2_potted_{ball_key}'] = current_stats.get(f'p2_potted_{ball_key}', 0)
+
+                        timeline_stats.append(timeline_entry)
+                        timeline_appended_this_frame = True
+
+                if frame_count % timeline_stride == 0 and not timeline_appended_this_frame:
+                    # Dense fallback sampling so rewind still updates even during temporary detection gaps.
+                    ts = frame_count / fps if fps > 0 else 0
+                    source = last_stats if isinstance(last_stats, dict) and len(last_stats) > 0 else {}
+
+                    timeline_entry = {
+                        'timestamp': ts,
+                        'player1_score': int(source.get('player1_score', track_res.get('player1_score', tracker.player_scores.get(1, 0)))),
+                        'player2_score': int(source.get('player2_score', track_res.get('player2_score', tracker.player_scores.get(2, 0)))),
+                        'current_player': int(source.get('current_player', track_res.get('current_player', tracker.current_player))),
+                        'potential_score': int(source.get('potential_score', track_res.get('points_remaining', tracker.get_max_points_remaining()))),
+                        'potted_balls': list(source.get('potted_balls', [])),
+                    }
+
+                    for ball_key in points.keys():
+                        p1_key = f'p1_potted_{ball_key}'
+                        p2_key = f'p2_potted_{ball_key}'
+                        timeline_entry[p1_key] = int(source.get(p1_key, track_res.get('potted_1', {}).get(ball_key, 0)))
+                        timeline_entry[p2_key] = int(source.get(p2_key, track_res.get('potted_2', {}).get(ball_key, 0)))
+
+                    timeline_stats.append(timeline_entry)
 
             if out is not None:
                 out.write(annotated_frame)
@@ -1350,6 +1511,16 @@ def process_video_job(job_id, temp_input, temp_output, color_mapping, color_over
             jobs[job_id]['processed_frames'] = frame_count
             if total_frames > 0:
                 jobs[job_id]['progress'] = int((frame_count / total_frames) * 100)
+
+            # Deterministic progress log cadence for long jobs.
+            if frame_count % 500 == 0:
+                if total_frames > 0:
+                    print(
+                        f"Job {job_id}: frame {frame_count}/{total_frames} "
+                        f"({jobs[job_id]['progress']}%) [500-frame checkpoint]"
+                    )
+                else:
+                    print(f"Job {job_id}: frame {frame_count} [500-frame checkpoint]")
 
             now_ts = time.time()
             if now_ts - last_heartbeat_ts >= 5.0:
@@ -1367,6 +1538,10 @@ def process_video_job(job_id, temp_input, temp_output, color_mapping, color_over
             out.release()
         
         if jobs[job_id].get('status') == 'cancelled':
+            playback_path = jobs[job_id].get('playback_path')
+            if playback_path and os.path.exists(playback_path):
+                try: os.remove(playback_path)
+                except: pass
             if os.path.exists(temp_output):
                 try: os.remove(temp_output)
                 except: pass
@@ -1389,12 +1564,37 @@ def process_video_job(job_id, temp_input, temp_output, color_mapping, color_over
         last_stats['visible_score'] = visible_value
         last_stats['potential_score'] = potential
         
+        # Keep timeline payload bounded for long videos so clients can fetch it
+        # reliably and use it for seek/rewind synchronization.
+        MAX_TIMELINE_POINTS = 4000
+        if len(timeline_stats) > MAX_TIMELINE_POINTS:
+            step = int(np.ceil(len(timeline_stats) / float(MAX_TIMELINE_POINTS)))
+            timeline_compact = timeline_stats[::step]
+            if timeline_compact and timeline_compact[-1] != timeline_stats[-1]:
+                timeline_compact.append(timeline_stats[-1])
+            print(
+                f"Job {job_id}: compacted timeline "
+                f"{len(timeline_stats)} -> {len(timeline_compact)} points (step={step})"
+            )
+            timeline_stats = timeline_compact
+
         response_data = {
             'summary': last_stats,
             'timeline': timeline_stats
         }
 
+        playback_path = None
+        if not PRESERVE_OUTPUT_VIDEO_QUALITY and os.path.exists(temp_output):
+            base, ext = os.path.splitext(temp_output)
+            candidate = f"{base}_playback{ext}"
+            if _make_playback_compatible_video(temp_output, candidate):
+                playback_path = candidate
+                print(f"Job {job_id}: playback-compatible video ready -> {playback_path}")
+            else:
+                print(f"Job {job_id}: using raw annotated output (no playback transcode).")
+
         jobs[job_id]['stats'] = response_data
+        jobs[job_id]['playback_path'] = playback_path
         jobs[job_id]['status'] = 'completed'
         print(f"Job {job_id} completed successfully.")
 
@@ -1402,6 +1602,10 @@ def process_video_job(job_id, temp_input, temp_output, color_mapping, color_over
         print(f"Job {job_id} failed: {e}")
         jobs[job_id]['status'] = 'error'
         jobs[job_id]['error'] = str(e)
+        playback_path = jobs[job_id].get('playback_path')
+        if playback_path and os.path.exists(playback_path):
+            try: os.remove(playback_path)
+            except: pass
         if os.path.exists(temp_input):
             try: os.remove(temp_input)
             except: pass
@@ -1418,9 +1622,9 @@ def start_video_predict():
     if file.filename == '':
         return jsonify({"error": "No selected file"}), 400
     
-    unique_filename = str(uuid.uuid4())
-    temp_input = f"{unique_filename}_input.mp4"
-    temp_output = f"{unique_filename}_output.mp4"
+    temp_input = _allocate_temp_input_path('input.mp4')
+    with _processed_name_lock:
+        temp_output = _allocate_processed_output_path()
     
     try:
         file.save(temp_input)
@@ -1453,6 +1657,7 @@ def start_video_predict():
         'progress': 0,
         'input_path': temp_input,
         'output_path': temp_output,
+        'playback_path': None,
         'created_at': time.time()
     }
     
@@ -1482,7 +1687,7 @@ def get_job_status(job_id):
         return jsonify({'error': 'Job not found'}), 404
     
     job = jobs[job_id]
-    return jsonify({
+    payload = {
         'job_id': job_id,
         'status': job['status'],
         'progress': job['progress'],
@@ -1490,11 +1695,29 @@ def get_job_status(job_id):
         'total_frames': job.get('total_frames', 0),
         'initial_points': job.get('initial_points'),
         'error': job.get('error')
-    })
+    }
+
+    # Provide lightweight fallback stats once processing is complete.
+    # IMPORTANT: for long videos, full timeline can be very large and may
+    # cause polling connection drops on mobile clients.
+    if job.get('status') == 'completed':
+        stats = job.get('stats')
+        if isinstance(stats, dict) and isinstance(stats.get('summary'), dict):
+            payload['summary'] = stats.get('summary')
+        include_timeline = request.args.get('include_timeline', '0').lower() in ('1', 'true', 'yes')
+        if include_timeline and isinstance(stats, dict) and isinstance(stats.get('timeline'), list):
+            # Optional explicit include for debugging/manual calls.
+            payload['timeline'] = stats.get('timeline')
+
+    return jsonify(payload)
 
 @app.route('/job_result/<job_id>', methods=['GET'])
 def get_job_result(job_id):
-    """Serve the processed video file and schedule temp file cleanup."""
+    """Serve the processed video file.
+
+    Do not delete files immediately after first response because the Flutter
+    video player performs additional range/seek requests during scrubbing.
+    """
     if job_id not in jobs:
         return jsonify({'error': 'Job not found'}), 404
     
@@ -1504,22 +1727,28 @@ def get_job_result(job_id):
         
     temp_output = job['output_path']
     input_path = job['input_path']
-    result_video_path = input_path if PRESERVE_OUTPUT_VIDEO_QUALITY else temp_output
-    
-    @after_this_request
-    def remove_files(response):
-        def cleanup():
-            time.sleep(2)
-            try:
-                if os.path.exists(temp_output): os.remove(temp_output)
-                if os.path.exists(input_path): os.remove(input_path)
-            except Exception as e:
-                print(f"Error removing files: {e}")
-            jobs.pop(job_id, None)  # Free memory
-        threading.Thread(target=cleanup, daemon=True).start()
-        return response
-    
-    response = make_response(send_file(result_video_path, mimetype='video/mp4'))
+    playback_path = job.get('playback_path')
+
+    # Prefer processed output, but gracefully fall back to the original upload
+    # when encoder/output generation fails unexpectedly.
+    if playback_path and os.path.exists(playback_path) and os.path.getsize(playback_path) > 0:
+        result_video_path = playback_path
+    else:
+        result_video_path = input_path if PRESERVE_OUTPUT_VIDEO_QUALITY else temp_output
+    if not os.path.exists(result_video_path) or os.path.getsize(result_video_path) <= 0:
+        if os.path.exists(input_path) and os.path.getsize(input_path) > 0:
+            print(
+                f"[WARN] Job {job_id}: processed output missing/empty "
+                f"({result_video_path}), serving original input instead."
+            )
+            result_video_path = input_path
+        else:
+            return jsonify({'error': 'Result video file is unavailable'}), 500
+
+    # conditional=True enables HTTP range requests for seeking/scrubbing.
+    response = make_response(
+        send_file(result_video_path, mimetype='video/mp4', conditional=True)
+    )
     # Keep header tiny to avoid client/header-size limits.
     response.headers['X-Snooker-Stats-Ref'] = job_id
     return response
@@ -1535,6 +1764,71 @@ def get_job_stats(job_id):
         return jsonify({'error': 'Job not completed'}), 400
 
     return jsonify(job.get('stats', {}))
+
+@app.route('/job_timeline/<job_id>', methods=['GET'])
+def get_job_timeline(job_id):
+    """Return only timeline data for a completed job (lighter than full stats)."""
+    if job_id not in jobs:
+        return jsonify({'error': 'Job not found'}), 404
+
+    job = jobs[job_id]
+    if job.get('status') != 'completed':
+        return jsonify({'error': 'Job not completed'}), 400
+
+    stats = job.get('stats', {})
+    timeline = stats.get('timeline', []) if isinstance(stats, dict) else []
+    summary = stats.get('summary', {}) if isinstance(stats, dict) else {}
+    return jsonify({
+        'job_id': job_id,
+        'timeline': timeline if isinstance(timeline, list) else [],
+        'summary': summary if isinstance(summary, dict) else {}
+    })
+
+@app.route('/job_timeline_chunk/<job_id>', methods=['GET'])
+def get_job_timeline_chunk(job_id):
+    """Return timeline data in chunks for large jobs to prevent connection drops."""
+    if job_id not in jobs:
+        return jsonify({'error': 'Job not found'}), 404
+
+    job = jobs[job_id]
+    if job.get('status') != 'completed':
+        return jsonify({'error': 'Job not completed'}), 400
+
+    stats = job.get('stats', {})
+    timeline = stats.get('timeline', []) if isinstance(stats, dict) else []
+    summary = stats.get('summary', {}) if isinstance(stats, dict) else {}
+    if not isinstance(timeline, list):
+        timeline = []
+    if not isinstance(summary, dict):
+        summary = {}
+
+    try:
+        offset = int(request.args.get('offset', 0))
+    except Exception:
+        offset = 0
+    try:
+        limit = int(request.args.get('limit', 500))
+    except Exception:
+        limit = 500
+
+    offset = max(0, offset)
+    limit = max(1, min(limit, 1000))
+
+    total = len(timeline)
+    end = min(total, offset + limit)
+    chunk = timeline[offset:end]
+
+    payload = {
+        'job_id': job_id,
+        'offset': offset,
+        'limit': limit,
+        'total': total,
+        'has_more': end < total,
+        'timeline': chunk,
+    }
+    if offset == 0:
+        payload['summary'] = summary
+    return jsonify(payload)
 
 @app.route('/video_predict', methods=['POST'])
 def video_predict():
@@ -1867,4 +2161,4 @@ def live_frame():
 
 if __name__ == '__main__':
     # host='0.0.0.0' allows access from other devices on the network.
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
