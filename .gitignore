@@ -2,3 +2,7 @@
 *.zip
 runs/
 __pycache__/
+firebase-key.json
+processed_videos/
+temp_videos/
+.claude/

@@ -1,4 +1,4 @@
-package com.example.snooker_ball_detector
+package com.example.snooker_app
 
 import io.flutter.embedding.android.FlutterActivity
 

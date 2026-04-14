@@ -1,0 +1,30 @@
+{
+  "project_info": {
+    "project_number": "107145098122",
+    "firebase_url": "https://snooker-ai-app-default-rtdb.asia-southeast1.firebasedatabase.app",
+    "project_id": "snooker-ai-app",
+    "storage_bucket": "snooker-ai-app.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:107145098122:android:e02f202f7d24cdc3ee8e73",
+        "android_client_info": {
+          "package_name": "com.example.snooker_app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDpS4IZ7QY4ZmCTceNMBB6WvFbA7Mib2AM"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

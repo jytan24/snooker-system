@@ -11,6 +11,9 @@ dependencies:
     sdk: flutter
   image_picker: ^1.0.4
   http: ^1.1.0
+  firebase_core: ^3.0.0
+  firebase_auth: ^5.0.0
+  cloud_firestore: ^5.0.0
   path: ^1.8.3
   video_player: ^2.11.0
   path_provider: ^2.1.5
@@ -25,7 +28,7 @@ dev_dependencies:
     sdk: flutter
   integration_test:
     sdk: flutter
-  flutter_lints: ^2.0.0
+  flutter_lints: ^6.0.0
 
 flutter:
   uses-material-design: true

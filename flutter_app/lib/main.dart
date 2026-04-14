@@ -10,6 +10,9 @@ import 'package:device_preview/device_preview.dart';
 import 'package:camera/camera.dart';
 import 'package:path_provider/path_provider.dart';
 import 'dart:async';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 
 List<CameraDescription> cameras = [];
 
@@ -20,6 +23,7 @@ const String _imageApiUrlOverride =
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp();
   try {
     cameras = await availableCameras();
   } catch (e) {
@@ -51,12 +55,360 @@ class MyApp extends StatelessWidget {
         ),
         useMaterial3: true,
       ),
-      home: const MyHomePage(title: 'Snooker Intelligent Analyzer'),
+      home: StreamBuilder<User?>(
+        stream: FirebaseAuth.instance.authStateChanges(),
+        builder: (context, snapshot) {
+          if (snapshot.connectionState == ConnectionState.waiting) {
+            return const Scaffold(
+              body: Center(child: CircularProgressIndicator()),
+            );
+          }
+          if (snapshot.hasData) {
+            return const MyHomePage(title: 'Snooker Intelligent Analyzer');
+          }
+          return const AuthScreen();
+        },
+      ),
+    );
+  }
+}
+
+// ============================================================================
+// Authentication Screen (Login & Register)
+// ============================================================================
+class AuthScreen extends StatefulWidget {
+  const AuthScreen({super.key});
+
+  @override
+  State<AuthScreen> createState() => _AuthScreenState();
+}
+
+class _AuthScreenState extends State<AuthScreen> {
+  final _emailController = TextEditingController();
+  final _pwController = TextEditingController();
+  bool _isLogin = true;
+  bool _isLoading = false;
+
+  Future<void> _submit() async {
+    setState(() => _isLoading = true);
+    try {
+      if (_isLogin) {
+        await FirebaseAuth.instance.signInWithEmailAndPassword(
+          email: _emailController.text.trim(),
+          password: _pwController.text.trim(),
+        );
+      } else {
+        await FirebaseAuth.instance.createUserWithEmailAndPassword(
+          email: _emailController.text.trim(),
+          password: _pwController.text.trim(),
+        );
+      }
+    } on FirebaseAuthException catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(e.message ?? 'Authentication failed')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
+  @override
+  void dispose() {
+    _emailController.dispose();
+    _pwController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(_isLogin ? 'Login' : 'Create Account'),
+        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+      ),
+      body: Center(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(24.0),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const Icon(Icons.sports, size: 80, color: Color(0xFF0D1B4C)),
+              const SizedBox(height: 32),
+              TextField(
+                controller: _emailController,
+                decoration: const InputDecoration(
+                  labelText: 'Email',
+                  border: OutlineInputBorder(),
+                  prefixIcon: Icon(Icons.email),
+                ),
+                keyboardType: TextInputType.emailAddress,
+              ),
+              const SizedBox(height: 16),
+              TextField(
+                controller: _pwController,
+                decoration: const InputDecoration(
+                  labelText: 'Password',
+                  border: OutlineInputBorder(),
+                  prefixIcon: Icon(Icons.lock),
+                ),
+                obscureText: true,
+              ),
+              const SizedBox(height: 24),
+              _isLoading
+                  ? const CircularProgressIndicator()
+                  : SizedBox(
+                      width: double.infinity,
+                      height: 50,
+                      child: ElevatedButton(
+                        onPressed: _submit,
+                        child: Text(
+                          _isLogin ? 'Login' : 'Register',
+                          style: const TextStyle(fontSize: 18),
+                        ),
+                      ),
+                    ),
+              const SizedBox(height: 16),
+              TextButton(
+                onPressed: () => setState(() => _isLogin = !_isLogin),
+                child: Text(_isLogin
+                    ? "Don't have an account? Register here"
+                    : 'Already have an account? Login here'),
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }
 
 /// Main scaffold with a Video / Live bottom-nav layout.
+// ============================================================================
+// History Screen — views tactical analysis records saved in Firestore
+// ============================================================================
+class HistoryScreen extends StatelessWidget {
+  const HistoryScreen({super.key});
+
+  void _showDetailDialog(BuildContext context, Map<String, dynamic> data, DateTime date) {
+    List<Map<String, dynamic>> allImages = [];
+
+    if (data['original_url'] != null) {
+      allImages.add({'type': 'Original Table', 'url': data['original_url'], 'difficulty': null, 'accuracy': null});
+    }
+
+    List<dynamic> redUrls = data['red_urls'] ?? [];
+    List<dynamic> redDiffs = data['red_difficulties'] ?? [];
+    List<dynamic> redAccs = data['red_accuracies'] ?? [];
+    for (int i = 0; i < redUrls.length; i++) {
+      allImages.add({
+        'type': 'Red Tactical',
+        'url': redUrls[i],
+        'difficulty': redDiffs.length > i ? redDiffs[i] : null,
+        'accuracy': redAccs.length > i ? redAccs[i] : null,
+      });
+    }
+
+    List<dynamic> colorUrls = data['color_urls'] ?? [];
+    List<dynamic> colorDiffs = data['color_difficulties'] ?? [];
+    List<dynamic> colorAccs = data['color_accuracies'] ?? [];
+    for (int i = 0; i < colorUrls.length; i++) {
+      allImages.add({
+        'type': 'Color Tactical',
+        'url': colorUrls[i],
+        'difficulty': colorDiffs.length > i ? colorDiffs[i] : null,
+        'accuracy': colorAccs.length > i ? colorAccs[i] : null,
+      });
+    }
+
+    if (allImages.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('No images found.')));
+      return;
+    }
+
+    final pageController = PageController();
+    int currentPage = 0;
+
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (dialogCtx, setDialogState) => AlertDialog(
+          contentPadding: EdgeInsets.zero,
+          clipBehavior: Clip.antiAlias,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          content: SizedBox(
+            width: MediaQuery.of(context).size.width * 0.9,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                SizedBox(
+                  height: 250,
+                  child: PageView.builder(
+                    controller: pageController,
+                    itemCount: allImages.length,
+                    onPageChanged: (i) => setDialogState(() => currentPage = i),
+                    itemBuilder: (_, i) => Image.network(
+                      allImages[i]['url'],
+                      fit: BoxFit.contain,
+                      loadingBuilder: (_, child, prog) => prog == null
+                          ? child
+                          : Container(color: Colors.grey[200], child: const Center(child: CircularProgressIndicator())),
+                      errorBuilder: (_, __, ___) => Container(
+                          color: Colors.grey[200],
+                          child: const Center(child: Icon(Icons.broken_image, size: 50, color: Colors.grey))),
+                    ),
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.all(16.0),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        '${allImages[currentPage]['type']} (#${currentPage + 1}/${allImages.length})',
+                        style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.teal[800]),
+                      ),
+                      if (allImages[currentPage]['difficulty'] != null)
+                        Text('Difficulty: ${allImages[currentPage]['difficulty']}',
+                            style: TextStyle(color: Colors.red[700])),
+                      if (allImages[currentPage]['accuracy'] != null)
+                        Text('Accuracy: ${allImages[currentPage]['accuracy']}',
+                            style: TextStyle(color: Colors.blue[700])),
+                      const SizedBox(height: 8),
+                      Text('${date.day}/${date.month}/${date.year}  ${date.hour.toString().padLeft(2, '0')}:${date.minute.toString().padLeft(2, '0')}',
+                          style: const TextStyle(color: Colors.grey)),
+                    ],
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 8, left: 16, right: 16),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      TextButton.icon(
+                        onPressed: currentPage > 0
+                            ? () => pageController.previousPage(duration: const Duration(milliseconds: 300), curve: Curves.easeInOut)
+                            : null,
+                        icon: const Icon(Icons.arrow_back),
+                        label: const Text('Prev'),
+                      ),
+                      TextButton.icon(
+                        onPressed: currentPage < allImages.length - 1
+                            ? () => pageController.nextPage(duration: const Duration(milliseconds: 300), curve: Curves.easeInOut)
+                            : null,
+                        icon: const Icon(Icons.arrow_forward),
+                        label: const Text('Next'),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('Close'))],
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('My Tactical History'),
+        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+      ),
+      backgroundColor: Colors.grey[100],
+      body: StreamBuilder<QuerySnapshot>(
+        stream: FirebaseFirestore.instance
+            .collection('histories')
+            .where('uid', isEqualTo: uid)
+            .snapshots(),
+        builder: (context, snapshot) {
+          if (snapshot.connectionState == ConnectionState.waiting) {
+            return const Center(child: CircularProgressIndicator());
+          }
+          if (snapshot.hasError) {
+            return Center(child: Text('Error: ${snapshot.error}'));
+          }
+          final docs = (snapshot.data?.docs ?? [])
+            ..sort((a, b) {
+              final aTs = (a.data() as Map<String, dynamic>)['timestamp'] as Timestamp?;
+              final bTs = (b.data() as Map<String, dynamic>)['timestamp'] as Timestamp?;
+              if (aTs == null && bTs == null) return 0;
+              if (aTs == null) return 1;
+              if (bTs == null) return -1;
+              return bTs.compareTo(aTs); // descending
+            });
+          if (docs.isEmpty) {
+            return const Center(
+              child: Text('No history yet.\nAnalyse a shot to get started!',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontSize: 16, color: Colors.grey)),
+            );
+          }
+          return ListView.builder(
+            padding: const EdgeInsets.all(12),
+            itemCount: docs.length,
+            itemBuilder: (ctx, i) {
+              final data = docs[i].data() as Map<String, dynamic>;
+              final timestamp = data['timestamp'] as Timestamp?;
+              final date = timestamp?.toDate() ?? DateTime.now();
+
+              List<dynamic> redUrls = data['red_urls'] ?? [];
+              List<dynamic> colorUrls = data['color_urls'] ?? [];
+              String? coverUrl = data['original_url'] ?? (redUrls.isNotEmpty ? redUrls[0] : null) ?? (colorUrls.isNotEmpty ? colorUrls[0] : null);
+
+              return Card(
+                elevation: 3,
+                clipBehavior: Clip.antiAlias,
+                margin: const EdgeInsets.only(bottom: 16),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                child: InkWell(
+                  onTap: () => _showDetailDialog(context, data, date),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      if (coverUrl != null)
+                        Image.network(coverUrl, height: 180, fit: BoxFit.cover,
+                            loadingBuilder: (_, child, prog) => prog == null
+                                ? child
+                                : Container(height: 180, color: Colors.grey[200], child: const Center(child: CircularProgressIndicator())),
+                            errorBuilder: (_, __, ___) => Container(height: 180, color: Colors.grey[200],
+                                child: const Center(child: Icon(Icons.broken_image, size: 40, color: Colors.grey))))
+                      else
+                        Container(height: 100, color: Colors.grey[300], child: const Center(child: Text('No Image'))),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                        color: Colors.white,
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Row(children: [
+                              const Icon(Icons.access_time, size: 16, color: Colors.grey),
+                              const SizedBox(width: 8),
+                              Text('${date.day}/${date.month}/${date.year}  ${date.hour.toString().padLeft(2, '0')}:${date.minute.toString().padLeft(2, '0')}',
+                                  style: const TextStyle(fontWeight: FontWeight.w500)),
+                            ]),
+                            const Text('Tap to view', style: TextStyle(color: Colors.teal, fontSize: 12, fontWeight: FontWeight.bold)),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            },
+          );
+        },
+      ),
+    );
+  }
+}
+
 class MyHomePage extends StatefulWidget {
   const MyHomePage({super.key, required this.title});
 
@@ -102,15 +454,26 @@ class _MyHomePageState extends State<MyHomePage> {
   int _lastAppliedTimelineIndex = -1;
   Duration? _lastVideoProcessDuration;
 
+  // Checkpoint cache for the potted-sequence rebuild.
+  // Stores a snapshot every 100 timeline entries so seek-forward operations
+  // resume from the nearest checkpoint rather than replaying from index 0.
+  int? _sequenceCacheIndex;
+  double? _sequenceCacheTime;
+  List<dynamic> _pottedSeqP1Cache = [];
+  List<dynamic> _pottedSeqP2Cache = [];
+  Map<String, dynamic>? _lastSeqStatsCache;
+
   File? _imageFile;
-  Uint8List? _resultImageBytes;
   bool _isImageAnalyzing = false;
   final List<Offset> _imageTapPoints = [];
   final GlobalKey _imageAnalysisKey = GlobalKey();
-  String? _shotMessage;
-  String? _shotDifficulty;
-  String? _shotTargetId;
-  String? _shotPocket;
+
+  // Multi-shot analysis state (from batch API)
+  List<dynamic> _redShots = [];
+  List<dynamic> _colorShots = [];
+  String _currentTargetType = 'red';
+  int _selectedRankIndex = 0;
+  List<List<double>>? _lastRelativeCorners;
 
   final ImagePicker _picker = ImagePicker();
 
@@ -167,6 +530,12 @@ class _MyHomePageState extends State<MyHomePage> {
       return override;
     }
     if (Platform.isAndroid) {
+      // Default to the Android emulator loopback address. For physical devices,
+      // supply the host machine's LAN IP via: flutter run --dart-define=SERVER_URL=http://&lt;ip&gt;:5000
+      // Recommend: persist last-used IP to shared_preferences or add a settings screen.
+      // For now, log a helpful message about using --dart-define
+      print(
+          "Using Android emulator default 10.0.2.2. For physical devices, use: flutter run --dart-define=SERVER_URL=http://<your-ip>:5000");
       return "http://10.0.2.2:5000";
     }
     return "http://127.0.0.1:5000";
@@ -626,6 +995,12 @@ class _MyHomePageState extends State<MyHomePage> {
     _statsTimeline = null;
     _pottedSeqP1.clear();
     _pottedSeqP2.clear();
+    // Clear the checkpoint cache so a future rebuild starts fresh.
+    _sequenceCacheIndex = null;
+    _sequenceCacheTime = null;
+    _pottedSeqP1Cache.clear();
+    _pottedSeqP2Cache.clear();
+    _lastSeqStatsCache = null;
     _lastSeqStats = null;
     _timelineStartStats = null;
     _lastVideoSeconds = 0.0;
@@ -723,6 +1098,12 @@ class _MyHomePageState extends State<MyHomePage> {
     _pottedSeqP1.clear();
     _pottedSeqP2.clear();
     _lastSeqStats = null;
+    // Invalidate the checkpoint cache: summary-based state is not timeline-derived.
+    _sequenceCacheIndex = null;
+    _sequenceCacheTime = null;
+    _pottedSeqP1Cache.clear();
+    _pottedSeqP2Cache.clear();
+    _lastSeqStatsCache = null;
 
     const balls = [
       'red-ball',
@@ -904,17 +1285,73 @@ class _MyHomePageState extends State<MyHomePage> {
     _lastSeqStats = null;
     if (_statsTimeline == null || _statsTimeline!.isEmpty) return;
 
-    for (final stat in _statsTimeline!) {
-      double t = 0.0;
-      if (stat.containsKey('timestamp')) {
-        final v = stat['timestamp'];
-        if (v is int) t = v.toDouble();
-        if (v is double) t = v;
+    // If a valid checkpoint exists at or before the target time, restore its
+    // cached state and continue scanning forward from there rather than
+    // replaying the entire timeline from index 0.
+    if (_sequenceCacheIndex != null &&
+        _sequenceCacheIndex! < _statsTimeline!.length &&
+        currentSeconds >= (_sequenceCacheTime ?? 0.0)) {
+      // Restore from checkpoint state
+      _pottedSeqP1.addAll(_pottedSeqP1Cache);
+      _pottedSeqP2.addAll(_pottedSeqP2Cache);
+      _lastSeqStats = _lastSeqStatsCache != null
+          ? Map<String, dynamic>.from(_lastSeqStatsCache!)
+          : null;
+
+      // Continue from checkpoint, not from start
+      for (int idx = _sequenceCacheIndex! + 1; idx < _statsTimeline!.length; idx++) {
+        final stat = _statsTimeline![idx];
+        double t = 0.0;
+        if (stat.containsKey('timestamp')) {
+          final v = stat['timestamp'];
+          if (v is int) t = v.toDouble();
+          if (v is double) t = v;
+        }
+
+        if (t <= currentSeconds) {
+          _updatePottedSequencesFromStats(Map<String, dynamic>.from(stat));
+        } else {
+          break;  // Stop once we reach currentSeconds
+        }
+
+        // Store checkpoint every 100 entries for next rebuild
+        if ((idx + 1) % 100 == 0) {
+          _sequenceCacheIndex = idx;
+          _sequenceCacheTime = t;
+          _pottedSeqP1Cache = List<dynamic>.from(_pottedSeqP1);
+          _pottedSeqP2Cache = List<dynamic>.from(_pottedSeqP2);
+          _lastSeqStatsCache = _lastSeqStats != null
+              ? Map<String, dynamic>.from(_lastSeqStats!)
+              : null;
+        }
       }
-      if (t <= currentSeconds) {
-        _updatePottedSequencesFromStats(Map<String, dynamic>.from(stat));
-      } else {
-        break;
+    } else {
+      // No valid checkpoint or seeking backwards: rebuild from start
+      for (int idx = 0; idx < _statsTimeline!.length; idx++) {
+        final stat = _statsTimeline![idx];
+        double t = 0.0;
+        if (stat.containsKey('timestamp')) {
+          final v = stat['timestamp'];
+          if (v is int) t = v.toDouble();
+          if (v is double) t = v;
+        }
+
+        if (t <= currentSeconds) {
+          _updatePottedSequencesFromStats(Map<String, dynamic>.from(stat));
+        } else {
+          break;  // Stop once we reach currentSeconds
+        }
+
+        // Store checkpoint every 100 entries for next rebuild
+        if ((idx + 1) % 100 == 0) {
+          _sequenceCacheIndex = idx;
+          _sequenceCacheTime = t;
+          _pottedSeqP1Cache = List<dynamic>.from(_pottedSeqP1);
+          _pottedSeqP2Cache = List<dynamic>.from(_pottedSeqP2);
+          _lastSeqStatsCache = _lastSeqStats != null
+              ? Map<String, dynamic>.from(_lastSeqStats!)
+              : null;
+        }
       }
     }
   }
@@ -934,26 +1371,31 @@ class _MyHomePageState extends State<MyHomePage> {
     Map<String, dynamic>? currentStats;
     int currentIndex = -1;
 
-    // Walk the sorted timeline to find the latest entry ≤ currentSeconds.
-    for (int i = 0; i < _statsTimeline!.length; i++) {
-      final stat = _statsTimeline![i];
+    // Binary search for the latest timeline entry at or before the current playback position.
+    int lo = 0, hi = _statsTimeline!.length - 1;
+    while (lo <= hi) {
+      final mid = (lo + hi) ~/ 2;
       double t = 0.0;
+      final stat = _statsTimeline![mid];
       if (stat.containsKey('timestamp')) {
         var val = stat['timestamp'];
         if (val is int) {
           t = val.toDouble();
         } else if (val is double) t = val;
       }
-
+      
       if (t <= currentSeconds) {
         currentStats = stat;
-        currentIndex = i;
+        currentIndex = mid;
+        lo = mid + 1;
       } else {
-        break;
+        hi = mid - 1;
       }
     }
 
     if (currentStats != null) {
+      // Skip rebuild and setState when the active timeline index hasn't changed
+      // during normal forward playback, reducing unnecessary widget rebuilds.
       if (isReplayOrSeekBack || currentIndex != _lastAppliedTimelineIndex) {
         final snapshot = Map<String, dynamic>.from(currentStats as Map);
         setState(() {
@@ -1128,21 +1570,22 @@ class _MyHomePageState extends State<MyHomePage> {
   Future<void> _pickImageForAnalysis(ImageSource source) async {
     final pickedFile = await _picker.pickImage(source: source);
     if (pickedFile == null) return;
+    PaintingBinding.instance.imageCache.clear();
+    PaintingBinding.instance.imageCache.clearLiveImages();
     setState(() {
       _imageFile = File(pickedFile.path);
-      _resultImageBytes = null;
       _imageTapPoints.clear();
-      _shotMessage = null;
-      _shotDifficulty = null;
-      _shotTargetId = null;
-      _shotPocket = null;
+      _redShots.clear();
+      _colorShots.clear();
+      _lastRelativeCorners = null;
+      _selectedRankIndex = 0;
     });
   }
 
   void _onImageAnalysisTap(TapUpDetails details) {
-    if (_imageFile == null || _resultImageBytes != null || _isImageAnalyzing) {
-      return;
-    }
+    if (_imageFile == null ||
+        (_redShots.isNotEmpty || _colorShots.isNotEmpty) ||
+        _isImageAnalyzing) return;
     if (_imageTapPoints.length >= 4) return;
 
     final box = _imageAnalysisKey.currentContext?.findRenderObject() as RenderBox?;
@@ -1154,37 +1597,46 @@ class _MyHomePageState extends State<MyHomePage> {
     });
 
     if (_imageTapPoints.length == 4) {
-      _askTargetTypeDialog();
+      _askInitialTargetColor();
     }
   }
 
-  void _askTargetTypeDialog() {
+  String _getImagePromptText() {
+    if (_imageFile == null) return 'Please select an image\nto begin tactical analysis.';
+    if (_redShots.isNotEmpty || _colorShots.isNotEmpty) return 'Tactical Analysis Complete';
+    switch (_imageTapPoints.length) {
+      case 0: return '📍 Step 1: Tap TOP-LEFT corner';
+      case 1: return '📍 Step 2: Tap TOP-RIGHT corner';
+      case 2: return '📍 Step 3: Tap BOTTOM-LEFT corner';
+      case 3: return '📍 Step 4: Tap BOTTOM-RIGHT corner';
+      default: return 'Processing Engine...';
+    }
+  }
+
+  void _askInitialTargetColor() {
     showDialog(
       context: context,
       barrierDismissible: false,
       builder: (ctx) => AlertDialog(
-        title: const Text('Select Target'),
-        content: const Text('Which ball type are you aiming for next?'),
+        title: const Text('Select Initial View'),
+        content: const Text(
+            'The AI will analyze BOTH red and color balls. Which one do you want to see first?'),
         actions: [
           TextButton(
-            onPressed: () {
-              Navigator.of(ctx).pop();
-              _sendImageToServer('red');
-            },
+            onPressed: () => _triggerBatchFetch('red'),
             child: const Text('Red Balls', style: TextStyle(color: Colors.red)),
           ),
           TextButton(
-            onPressed: () {
-              Navigator.of(ctx).pop();
-              _sendImageToServer('color');
-            },
-            child:
-                const Text('Color Balls', style: TextStyle(color: Colors.blue)),
+            onPressed: () => _triggerBatchFetch('color'),
+            child: const Text('Color Balls', style: TextStyle(color: Colors.blue)),
           ),
           TextButton(
             onPressed: () {
               Navigator.of(ctx).pop();
-              setState(() => _imageTapPoints.clear());
+              setState(() {
+                _imageTapPoints.clear();
+                _lastRelativeCorners = null;
+              });
             },
             style: TextButton.styleFrom(foregroundColor: Colors.grey),
             child: const Text('Retap Corners'),
@@ -1205,7 +1657,12 @@ class _MyHomePageState extends State<MyHomePage> {
           TextButton(
             onPressed: () {
               Navigator.of(ctx).pop();
-              setState(() => _imageTapPoints.clear());
+              if (_redShots.isEmpty && _colorShots.isEmpty) {
+                setState(() {
+                  _imageTapPoints.clear();
+                  _lastRelativeCorners = null;
+                });
+              }
             },
             child: const Text('OK'),
           )
@@ -1214,17 +1671,21 @@ class _MyHomePageState extends State<MyHomePage> {
     );
   }
 
-  Future<void> _sendImageToServer(String targetType) async {
-    if (_imageFile == null) return;
+  Future<void> _triggerBatchFetch(String initialTarget) async {
+    if (_isImageAnalyzing) return;
+    Navigator.of(context).pop();
+
     final box = _imageAnalysisKey.currentContext?.findRenderObject() as RenderBox?;
     if (box == null || box.size.width <= 0 || box.size.height <= 0) return;
 
-    final width = box.size.width;
-    final height = box.size.height;
+    _lastRelativeCorners = _imageTapPoints
+        .map((p) => [p.dx / box.size.width, p.dy / box.size.height])
+        .toList();
 
     setState(() {
       _isImageAnalyzing = true;
-      _shotMessage = null;
+      _currentTargetType = initialTarget;
+      _selectedRankIndex = 0;
     });
 
     try {
@@ -1233,85 +1694,181 @@ class _MyHomePageState extends State<MyHomePage> {
         Uri.parse('$imageApiUrl/analyze_shot'),
       );
       req.files.add(await http.MultipartFile.fromPath('image', _imageFile!.path));
+      req.fields['corners'] = jsonEncode(_lastRelativeCorners);
+      req.fields['uid'] = FirebaseAuth.instance.currentUser?.uid ?? 'anonymous';
 
-      final corners = _imageTapPoints.map((p) => [p.dx / width, p.dy / height]).toList();
-      req.fields['corners'] = jsonEncode(corners);
-      req.fields['target_type'] = targetType;
-
-      final resp = await req.send().timeout(const Duration(seconds: 120));
+      final resp = await req.send().timeout(const Duration(seconds: 150));
       final bodyText = await resp.stream.bytesToString();
       final body = jsonDecode(bodyText);
 
-      if (resp.statusCode == 200 && body['status'] == 'success') {
+      if (body['status'] == 'success') {
         setState(() {
-          _resultImageBytes = base64Decode(body['image_base64'] as String);
-          _shotMessage = (body['message'] ?? '').toString();
-          _shotDifficulty = (body['difficulty_score'] ?? 'N/A').toString();
-          _shotTargetId = (body['target_id'] ?? 'N/A').toString();
-          _shotPocket = (body['pocket'] ?? 'N/A').toString();
+          _redShots = body['red_shots'] ?? [];
+          _colorShots = body['color_shots'] ?? [];
           _imageTapPoints.clear();
         });
       } else {
-        _showImageErrorDialog(
-            (body['message'] ?? 'Shot analysis failed').toString());
+        _showImageErrorDialog((body['message'] ?? 'Shot analysis failed').toString());
       }
     } catch (e) {
-      _showImageErrorDialog(
-          'Connection failed. Check if Python is running and the image is not too large.');
+      print('===== IMAGE ANALYSIS ERROR =====');
+      print(e);
+      _showImageErrorDialog('System Error: Server memory limit or Network drop.');
     } finally {
       if (mounted) {
-        setState(() {
-          _isImageAnalyzing = false;
-        });
+        setState(() => _isImageAnalyzing = false);
       }
     }
   }
 
-  Widget _buildImageDashboard() {
-    if (_shotMessage == null) return const SizedBox.shrink();
-    final bool isSafety = _shotDifficulty == 'N/A';
+  List<dynamic> _getCurrentImageShots() {
+    return _currentTargetType == 'red' ? _redShots : _colorShots;
+  }
 
-    return Card(
-      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-      elevation: 4,
-      color: isSafety ? Colors.orange[50] : Colors.green[50],
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Icon(
-                  isSafety ? Icons.warning_amber_rounded : Icons.check_circle_outline,
-                  color: isSafety ? Colors.orange : Colors.green,
+  Widget _buildImageDashboard() {
+    final currentShots = _getCurrentImageShots();
+    if (currentShots.isEmpty) return const SizedBox.shrink();
+
+    final String message = currentShots[0]['message']?.toString() ?? '';
+    final String ballLabel = _currentTargetType == 'red' ? 'Red' : 'Colour';
+
+    // Case: no balls of this type were detected by YOLO
+    if (message == 'no_balls_detected') {
+      return Card(
+        margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        elevation: 4,
+        color: Colors.grey[100],
+        child: Padding(
+          padding: const EdgeInsets.all(16.0),
+          child: Row(
+            children: [
+              const Icon(Icons.search_off, color: Colors.grey, size: 28),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  '$ballLabel ball not detected on the table.',
+                  style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600, color: Colors.black54),
                 ),
-                const SizedBox(width: 8),
-                Text(
-                  isSafety ? 'Safety Shot Required' : 'Shot Route Confirmed',
-                  style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-                ),
-              ],
-            ),
-            const Divider(),
-            Text(_shotMessage ?? '', style: const TextStyle(fontSize: 14)),
-            if (!isSafety) ...[
-              Text('🎯 Target Ball: Number $_shotTargetId',
-                  style: const TextStyle(fontSize: 16)),
-              const SizedBox(height: 4),
-              Text('⛳ Target Pocket: $_shotPocket',
-                  style: const TextStyle(fontSize: 16)),
-              const SizedBox(height: 4),
-              Text('🔥 Difficulty Score: $_shotDifficulty (Lower is easier)',
-                  style: const TextStyle(fontSize: 16)),
-            ] else ...[
-              const Text(
-                'All attacking routes are blocked. The system has calculated the closest ball to play a safe defensive shot.',
-                style: TextStyle(fontSize: 14),
               ),
-            ]
-          ],
+            ],
+          ),
         ),
+      );
+    }
+
+    // Case: balls exist but every attack path is blocked (snookered / obstructed)
+    if (message == 'all_paths_blocked') {
+      return Card(
+        margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        elevation: 4,
+        color: Colors.orange[50],
+        child: Padding(
+          padding: const EdgeInsets.all(16.0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  const Icon(Icons.block, color: Colors.orange, size: 26),
+                  const SizedBox(width: 8),
+                  const Text('Attack Path Blocked',
+                      style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
+                ],
+              ),
+              const Divider(),
+              Text(
+                'All attacking routes for the $ballLabel ball are blocked. '
+                'You are snookered — the system recommends playing a safety shot '
+                'by hitting the nearest $ballLabel ball directly (shown on the image).',
+                style: const TextStyle(fontSize: 14),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 12.0, vertical: 8.0),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('🔥 Top Tactical Routes',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 8),
+          Row(
+            children: List.generate(currentShots.length, (index) {
+              final shot = currentShots[index];
+              final bool isSelected = index == _selectedRankIndex;
+              return Expanded(
+                child: GestureDetector(
+                  onTap: () => setState(() => _selectedRankIndex = index),
+                  child: Card(
+                    color: isSelected ? Colors.teal[50] : Colors.white,
+                    elevation: isSelected ? 4 : 1,
+                    shape: RoundedRectangleBorder(
+                      side: BorderSide(
+                          color: isSelected ? Colors.teal : Colors.transparent,
+                          width: 2),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                          vertical: 12.0, horizontal: 4.0),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text('Rank ${shot['rank']}',
+                              style: TextStyle(
+                                  fontWeight: FontWeight.bold,
+                                  color: isSelected
+                                      ? Colors.teal
+                                      : Colors.black87)),
+                          const SizedBox(height: 4),
+                          const Text('Route', style: TextStyle(fontSize: 12)),
+                          const SizedBox(height: 4),
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 6, vertical: 2),
+                            decoration: BoxDecoration(
+                                color: isSelected
+                                    ? Colors.red[100]
+                                    : Colors.grey[200],
+                                borderRadius: BorderRadius.circular(4)),
+                            child: Text('Diff: ${shot['difficulty']}',
+                                style: TextStyle(
+                                    fontSize: 12,
+                                    color: isSelected
+                                        ? Colors.red[700]
+                                        : Colors.black87,
+                                    fontWeight: FontWeight.bold)),
+                          ),
+                          const SizedBox(height: 4),
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 6, vertical: 2),
+                            decoration: BoxDecoration(
+                                color: isSelected
+                                    ? Colors.blue[100]
+                                    : Colors.grey[200],
+                                borderRadius: BorderRadius.circular(4)),
+                            child: Text('Acc: ${shot['accuracy'] ?? 'N/A'}',
+                                style: TextStyle(
+                                    fontSize: 12,
+                                    color: isSelected
+                                        ? Colors.blue[700]
+                                        : Colors.black87,
+                                    fontWeight: FontWeight.bold)),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              );
+            }),
+          ),
+        ],
       ),
     );
   }
@@ -1324,15 +1881,36 @@ class _MyHomePageState extends State<MyHomePage> {
           children: [
             CircularProgressIndicator(),
             SizedBox(height: 16),
-            Text('AI is calculating shot routes...'),
+            Text('AI is generating ALL tactical routes...'),
+            Text('(This may take a few seconds)',
+                style: TextStyle(fontSize: 12, color: Colors.grey)),
           ],
         ),
       );
     }
 
+    final currentShots = _getCurrentImageShots();
+
     Widget imageContent;
-    if (_resultImageBytes != null) {
-      imageContent = Image.memory(_resultImageBytes!);
+    if (currentShots.isNotEmpty) {
+      final imageUrl = currentShots[_selectedRankIndex]['image_url'] as String;
+      imageContent = Image.network(
+        imageUrl,
+        gaplessPlayback: true,
+        loadingBuilder: (context, child, loadingProgress) {
+          if (loadingProgress == null) return child;
+          return Container(
+            height: 400,
+            color: Colors.grey[200],
+            child: const Center(child: CircularProgressIndicator()),
+          );
+        },
+        errorBuilder: (context, error, stackTrace) => Container(
+          height: 400,
+          color: Colors.grey[200],
+          child: const Center(child: Text('Failed to load image from server')),
+        ),
+      );
     } else if (_imageFile != null) {
       imageContent = Image.file(_imageFile!);
     } else {
@@ -1341,40 +1919,80 @@ class _MyHomePageState extends State<MyHomePage> {
         width: double.infinity,
         color: Colors.grey[300],
         child: const Center(
-          child: Text(
-            'Please select an image\nto begin tactical analysis.',
-            textAlign: TextAlign.center,
-          ),
+          child: Icon(Icons.image_search, size: 60, color: Colors.grey),
         ),
       );
     }
 
-    return Center(
-      child: SingleChildScrollView(
-        child: Column(
-          children: [
+    return SingleChildScrollView(
+      child: Column(
+        children: [
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(vertical: 12),
+            color: Colors.black87,
+            child: Text(
+              _getImagePromptText(),
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 16,
+                  fontWeight: FontWeight.bold),
+            ),
+          ),
+          if (_redShots.isNotEmpty || _colorShots.isNotEmpty)
             Padding(
-              padding: const EdgeInsets.all(8.0),
-              child: GestureDetector(
-                onTapUp: _onImageAnalysisTap,
-                child: Stack(
-                  key: _imageAnalysisKey,
-                  children: [
-                    imageContent,
-                    ..._imageTapPoints.map((point) => Positioned(
-                          left: point.dx - 5,
-                          top: point.dy - 5,
-                          child: const Icon(Icons.circle,
-                              color: Colors.greenAccent, size: 10),
-                        )),
-                  ],
+              padding: const EdgeInsets.only(top: 16.0, bottom: 8.0),
+              child: SegmentedButton<String>(
+                segments: const [
+                  ButtonSegment<String>(
+                    value: 'red',
+                    label: Text('Red Balls'),
+                    icon: Icon(Icons.circle, color: Colors.red, size: 16),
+                  ),
+                  ButtonSegment<String>(
+                    value: 'color',
+                    label: Text('Color Balls'),
+                    icon: Icon(Icons.circle, color: Colors.blue, size: 16),
+                  ),
+                ],
+                selected: {_currentTargetType},
+                onSelectionChanged: (Set<String> newSelection) {
+                  final selected = newSelection.first;
+                  if (selected != _currentTargetType) {
+                    setState(() {
+                      _currentTargetType = selected;
+                      _selectedRankIndex = 0;
+                    });
+                  }
+                },
+                style: SegmentedButton.styleFrom(
+                  selectedBackgroundColor: Colors.teal[100],
                 ),
               ),
             ),
-            _buildImageDashboard(),
-            const SizedBox(height: 80),
-          ],
-        ),
+          Padding(
+            padding: const EdgeInsets.all(8.0),
+            child: GestureDetector(
+              onTapUp: _onImageAnalysisTap,
+              child: Stack(
+                key: _imageAnalysisKey,
+                children: [
+                  imageContent,
+                  if (_redShots.isEmpty && _colorShots.isEmpty)
+                    ..._imageTapPoints.map((point) => Positioned(
+                          left: point.dx - 8,
+                          top: point.dy - 8,
+                          child: const Icon(Icons.my_location,
+                              color: Colors.greenAccent, size: 16),
+                        )),
+                ],
+              ),
+            ),
+          ),
+          _buildImageDashboard(),
+          const SizedBox(height: 200),
+        ],
       ),
     );
   }
@@ -1410,6 +2028,26 @@ class _MyHomePageState extends State<MyHomePage> {
           _selectedIndex == 2 ? 'Snooker AI Tactical System' : widget.title,
         ),
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+        actions: [
+          IconButton(
+            tooltip: 'View History',
+            icon: const CircleAvatar(
+              backgroundColor: Colors.white,
+              child: Icon(Icons.history, color: Colors.teal),
+            ),
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const HistoryScreen()),
+            ),
+          ),
+          IconButton(
+            tooltip: 'Logout',
+            icon: const Icon(Icons.logout),
+            onPressed: () async {
+              await FirebaseAuth.instance.signOut();
+            },
+          ),
+        ],
       ),
       bottomNavigationBar: BottomNavigationBar(
         currentIndex: _selectedIndex,
@@ -2039,35 +2677,41 @@ class _MyHomePageState extends State<MyHomePage> {
           _isFrameProcessing = true;
           try {
             XFile file = await _cameraController!.takePicture();
-            var request = http.MultipartRequest(
-                'POST', Uri.parse('$serverUrl/live/frame'));
-            request.fields['session_id'] = _liveSessionId!;
-            request.files
-                .add(await http.MultipartFile.fromPath('file', file.path));
-
-            var resp = await request.send();
-
-            // Delete temp image to prevent disk fill-up and IO lag.
             try {
-              await File(file.path).delete();
-            } catch (e) {
-              print("Error deleting temp file: $e");
-            }
+              var request = http.MultipartRequest(
+                  'POST', Uri.parse('$serverUrl/live/frame'));
+              request.fields['session_id'] = _liveSessionId!;
+              request.files
+                  .add(await http.MultipartFile.fromPath('file', file.path));
 
-            if (resp.statusCode == 200) {
-              String respStr = await resp.stream.bytesToString();
-              var body = jsonDecode(respStr);
-              if (body['image'] != null && mounted) {
-                var bytes = base64Decode(body['image']);
-                setState(() {
-                  if (body['stats'] != null) {
-                    _updatePottedSequencesFromStats(
-                        Map<String, dynamic>.from(body['stats']));
-                  }
-                  _cameraFrameResult = Image.memory(bytes,
-                      gaplessPlayback: true, fit: BoxFit.contain);
-                  _liveStats = body['stats'];
-                });
+              var resp = await request.send();
+
+              if (resp.statusCode == 200) {
+                String respStr = await resp.stream.bytesToString();
+                var body = jsonDecode(respStr);
+                if (body['image'] != null && mounted) {
+                  var bytes = base64Decode(body['image']);
+                  setState(() {
+                    if (body['stats'] != null) {
+                      _updatePottedSequencesFromStats(
+                          Map<String, dynamic>.from(body['stats']));
+                    }
+                    _cameraFrameResult = Image.memory(bytes,
+                        gaplessPlayback: true, fit: BoxFit.contain);
+                    _liveStats = body['stats'] != null
+                        ? Map<String, dynamic>.from(
+                            body['stats'] as Map<String, dynamic>)
+                        : null;
+                  });
+                }
+              }
+            } finally {
+              // Always delete the temp file regardless of success or failure
+              // to prevent unbounded disk usage over repeated recordings.
+              try {
+                await File(file.path).delete();
+              } catch (e) {
+                print("Error deleting temp file: $e");
               }
             }
           } catch (e) {
@@ -2082,10 +2726,22 @@ class _MyHomePageState extends State<MyHomePage> {
     }
   }
 
-  /// Stop the live analysis timer and update UI.
+  /// Stop the live analysis timer and notify the server to release the session.
   void _stopLiveTracking() {
+    // Notify the server to clean up the session before clearing local state,
+    // so the server does not hold the session object indefinitely.
+    if (_liveSessionId != null) {
+      http
+          .post(
+            Uri.parse('$serverUrl/live/stop'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({'session_id': _liveSessionId}),
+          )
+          .catchError((_) => http.Response('', 200)); // Fire-and-forget; ignore network errors on stop.
+    }
     setState(() {
       _isLiveTracking = false;
+      _liveSessionId = null;
       _liveTimer?.cancel();
       _liveTimer = null;
     });
@@ -2206,7 +2862,7 @@ class _PocketCalibrationDialogState extends State<_PocketCalibrationDialog> {
   static const int _requiredPoints = 6;
   static const double _dotRadius = 14.0;
   // Server uses a 70 px radius in video-pixel space to decide if a ball is potted.
-  static const double _pocketZoneVideoRadius = 70.0;
+  static const double _pocketZoneVideoRadius = 100.0;
 
   /// Convert a widget-space tap to video pixel coordinates.
   Offset _toVideoCoords(Offset widgetTap) {
@@ -2287,7 +2943,7 @@ class _PocketCalibrationDialogState extends State<_PocketCalibrationDialog> {
                 ),
                 const SizedBox(height: 4),
                 const Text(
-                  'Green circle = 70 px valid-pot zone',
+                  'Green circle = 100 px valid-pot zone',
                   style: TextStyle(color: Colors.white38, fontSize: 11),
                   textAlign: TextAlign.center,
                 ),

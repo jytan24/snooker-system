@@ -74,6 +74,9 @@ app = Flask(__name__)
 logging.getLogger('werkzeug').setLevel(logging.WARNING)  # Suppress repetitive /job_status poll logs
 
 jobs = {}
+_jobs_lock = threading.Lock()       # Protects concurrent read/write access to the jobs dict across worker threads.
+_inference_lock = threading.Lock()  # Serialises model.track() calls to prevent ByteTrack internal state corruption.
+_cached_ffmpeg_bin = None           # Cached ffmpeg executable path, resolved once at first use.
 
 # When True, processed job returns the original uploaded video (no annotation overlays).
 PRESERVE_OUTPUT_VIDEO_QUALITY = False
@@ -81,6 +84,41 @@ PRESERVE_OUTPUT_VIDEO_QUALITY = False
 TEMP_VIDEO_DIR = os.path.abspath('temp_videos')
 PROCESSED_VIDEO_DIR = os.path.abspath('processed_videos')
 _processed_name_lock = threading.Lock()
+
+def _get_ffmpeg_bin():
+    """Return the ffmpeg executable path, resolving it once and caching the result."""
+    global _cached_ffmpeg_bin
+    if _cached_ffmpeg_bin is not None:
+        return _cached_ffmpeg_bin
+    ffmpeg = shutil.which('ffmpeg')
+    try:
+        if not ffmpeg:
+            import imageio_ffmpeg
+            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        pass
+    _cached_ffmpeg_bin = ffmpeg
+    return _cached_ffmpeg_bin
+
+def _cleanup_old_jobs(max_age_seconds=3600):
+    """Remove completed/error/cancelled jobs older than max_age_seconds."""
+    now = time.time()
+    with _jobs_lock:
+        expired = [jid for jid, j in jobs.items()
+                   if now - j.get('created_at', now) > max_age_seconds
+                   and j.get('status') in ('completed', 'error', 'cancelled')]
+        for jid in expired:
+            job = jobs[jid]
+            # Clean up files
+            for path_key in ['playback_path', 'output_path', 'input_path']:
+                fpath = job.get(path_key)
+                if fpath and os.path.exists(fpath):
+                    try:
+                        os.remove(fpath)
+                    except Exception as e:
+                        print(f"Warning: could not delete {fpath}: {e}")
+            del jobs[jid]
+            print(f"Cleaned up expired job {jid}")
 
 
 def _allocate_processed_output_path():
@@ -110,15 +148,7 @@ def _make_playback_compatible_video(source_path, dest_path):
         if not os.path.exists(source_path) or os.path.getsize(source_path) <= 0:
             return False
 
-        ffmpeg_bin = shutil.which('ffmpeg')
-        if not ffmpeg_bin:
-            try:
-                import imageio_ffmpeg
-
-                ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
-                print(f"Using bundled ffmpeg from imageio-ffmpeg: {ffmpeg_bin}")
-            except Exception:
-                ffmpeg_bin = None
+        ffmpeg_bin = _get_ffmpeg_bin()
 
         if not ffmpeg_bin:
             print('[WARN] ffmpeg not found in PATH and bundled ffmpeg unavailable; skip playback transcode.')
@@ -199,6 +229,14 @@ class SnookerGameTracker:
         self.frames_since_motion = 0
         self.shot_active_debounced = False
 
+        # Auto turn-switch tracking.
+        # prev_shot_active_debounced lets us detect the True→False transition
+        # (shot fully settled) without requiring the caller to track it.
+        # pot_happened_this_shot is set True as soon as any ball is potted or a
+        # foul fires, preventing the auto-switch from double-switching the turn.
+        self.prev_shot_active_debounced = False
+        self.pot_happened_this_shot = False
+
     def get_stable_counts(self):
         """Return a snapshot of the most recent ball counts used for reporting."""
         return dict(self.last_stable_counts)
@@ -212,10 +250,19 @@ class SnookerGameTracker:
         print(msg)
 
     def manual_miss(self):
-        """Handle a manually signalled miss by switching turn and resetting phase."""
+        """Handle a manually signalled miss by switching turn.
+
+        If no reds remain (clearance phase), the opponent continues from the
+        same next_clearance_target position rather than reverting to red-phase logic.
+        """
         self.switch_turn()
-        self.state = 'AwaitingBreak'
-        print("Manual miss: turn switched and phase reset to AwaitingBreak.")
+        reds_remaining = self.last_stable_counts.get('red-ball', 0)
+        if self.state == 'ClearancePhase' or reds_remaining == 0:
+            self.state = 'ClearancePhase'
+            print(f"Manual miss: turn switched, staying in ClearancePhase (next: {self.color_order[self.next_clearance_target] if self.next_clearance_target < len(self.color_order) else 'done'})")
+        else:
+            self.state = 'AwaitingBreak'
+            print("Manual miss: turn switched, reset to AwaitingBreak.")
 
     def _set_clearance_target_from_counts(self, counts):
         """Reset the clearance target to Yellow (index 0) regardless of current YOLO counts.
@@ -228,7 +275,15 @@ class SnookerGameTracker:
         self.next_clearance_target = 0
 
     def _handle_foul(self, foul_ball_key_or_value, counts, reason=""):
-        """Award foul points (minimum 4) to the opponent, switch turn, and reset to AwaitingBreak."""
+        """Award foul points (minimum 4) to the opponent, switch turn, and set next state.
+
+        After a foul the next state depends on whether reds are still on the table:
+          - Reds remain   → AwaitingBreak (opponent must pot a red next)
+          - No reds left  → ClearancePhase (opponent continues the colour sequence
+                            from the current next_clearance_target position)
+        This prevents an infinite-foul loop when a foul occurs during ColourNomination
+        on the last red, or mid-way through ClearancePhase.
+        """
         opponent = 2 if self.current_player == 1 else 1
         if isinstance(foul_ball_key_or_value, (int, float)):
             foul_value = max(4, int(foul_ball_key_or_value))
@@ -246,9 +301,16 @@ class SnookerGameTracker:
         msg = f"[FOUL] P{self.current_player} {reason} -> +{foul_value} to P{opponent}"
         self.action_log.append({"type": "foul", "msg": msg})
         print(msg)
-        
+
         self.switch_turn()
-        self.state = 'AwaitingBreak'
+
+        # Determine the correct post-foul state based on whether reds remain.
+        reds_remaining = (counts or self.last_stable_counts).get('red-ball', 0)
+        if self.state == 'ClearancePhase' or reds_remaining == 0:
+            self.state = 'ClearancePhase'
+            print(f"[FSM] Post-foul: no reds on table, staying in ClearancePhase (next target: {self.color_order[self.next_clearance_target] if self.next_clearance_target < len(self.color_order) else 'done'})")
+        else:
+            self.state = 'AwaitingBreak'
 
     def get_max_points_remaining(self):
         """Calculate the theoretical maximum points still available on the table."""
@@ -305,6 +367,16 @@ class SnookerGameTracker:
             if self.frames_since_motion > int(self.fps * 2.0):
                 self.shot_active_debounced = False
 
+        # Detect shot lifecycle transitions for auto turn-switch logic.
+        # shot_just_started: first frame of a new stroke → reset the pot flag.
+        # shot_just_settled: debounce expired after last motion → evaluate outcome.
+        shot_just_started  = not self.prev_shot_active_debounced and self.shot_active_debounced
+        shot_just_settled  = self.prev_shot_active_debounced and not self.shot_active_debounced
+        self.prev_shot_active_debounced = self.shot_active_debounced
+
+        if shot_just_started:
+            self.pot_happened_this_shot = False
+
         if potted_balls is None:
             potted_balls = []
 
@@ -315,6 +387,11 @@ class SnookerGameTracker:
 
         potted_balls = self.shot_potted_buffer + potted_balls
         self.shot_potted_buffer = []
+
+        # Mark that something was potted this shot before any early returns,
+        # so the auto turn-switch at the end of this method does not fire.
+        if potted_balls:
+            self.pot_happened_this_shot = True
 
         if any(ball == 'white-ball' for ball in potted_balls):
             self._handle_foul('white-ball', counts, reason="potted White ball")
@@ -397,6 +474,14 @@ class SnookerGameTracker:
                             self._handle_foul(ball, counts, reason="potted wrong clearance colour")
                             break
 
+        # Auto turn-switch: shot fully settled (2-s debounce expired) with no pot and no foul.
+        # Covers both missed shots and deliberate safety shots — both end the turn in snooker.
+        if shot_just_settled and not self.pot_happened_this_shot and self.shot_id > 0:
+            self.switch_turn()
+            msg = f"[AUTO] No pot detected — turn passed to P{self.current_player}"
+            self.action_log.append({"type": "info", "msg": msg})
+            print(msg)
+
         return self._result()
 
 class BallCoordinateTracker:
@@ -410,7 +495,7 @@ class BallCoordinateTracker:
     - Once potted, a track is never re-matched to prevent double-pot events.
     """
 
-    POCKET_ZONE_RADIUS = 70.0   # px in video pixel space (matches calibration UI)
+    POCKET_ZONE_RADIUS = 100.0   # px in video pixel space (matches calibration UI)
 
     def __init__(
         self,
@@ -507,13 +592,13 @@ class BallCoordinateTracker:
         return collisions
 
     def _in_pocket_zone(self, raw_x, raw_y):
-        """Return True if (raw_x, raw_y) is within 130px of any calibrated pocket.
+        """Return True if (raw_x, raw_y) is within POCKET_ZONE_RADIUS px of any calibrated pocket.
         If no pocket calibration has been set, returns True for all positions
         (any disappearance counts as a pot)."""
         if not self.pocket_points_2d:
             return True  # No calibration — accept all disappearances.
         for px, py in self.pocket_points_2d:
-            if self._distance(raw_x, raw_y, px, py) <= 130.0:
+            if self._distance(raw_x, raw_y, px, py) <= self.POCKET_ZONE_RADIUS:
                 return True
         return False
 
@@ -840,16 +925,20 @@ def correct_label_by_hsv(pred_key, hsv_avg, pred_conf=None):
         return pred_key
 
     h, s, v = hsv_avg
+    conf = float(pred_conf) if pred_conf is not None else 1.0
 
-    # Hard overrides (highest priority): bypass YOLO label when HSV strongly matches.
-    # Force Blue
-    if 90 <= h <= 130 and s > 80 and v > 50:
+    # Gate all HSV overrides behind a confidence threshold so that strong
+    # YOLO predictions are never flipped by ambiguous colour evidence.
+    weak_prediction = conf < 0.70
+    
+    # Force Blue (only if model confidence is weak)
+    if weak_prediction and 90 <= h <= 130 and s > 80 and v > 50:
         return 'blue-ball'
     # Force Green
-    if 40 <= h <= 85 and s > 60 and v > 50:
+    if weak_prediction and 40 <= h <= 85 and s > 60 and v > 50:
         return 'green-ball'
     # Force Brown
-    if 10 <= h <= 30 and s > 50 and 30 <= v <= 150:
+    if weak_prediction and 10 <= h <= 30 and s > 50 and 30 <= v <= 150:
         return 'brown-ball'
 
     # Very low saturation -> likely achromatic ball under glare/shadow.
@@ -867,9 +956,7 @@ def correct_label_by_hsv(pred_key, hsv_avg, pred_conf=None):
 
     # Be conservative: only override red/blue when model confidence is not strong.
     # This avoids flipping true reds to blue due to ROI drift over table cloth during motion.
-    conf = float(pred_conf) if pred_conf is not None else 1.0
-    weak_prediction = conf < 0.45
-
+    # Use the same 0.70 threshold defined above for consistency.
     if pred_key == 'red-ball':
         if weak_prediction and is_blue_hue and s >= 80:
             return 'blue-ball'
@@ -1144,13 +1231,17 @@ def process_video_job(job_id, temp_input, temp_output, color_mapping, color_over
             
             yolo_frame = frame
 
-            results = model.track(
-                yolo_frame,
-                tracker='bytetrack.yaml',
-                persist=(frame_count > 0),
-                conf=0.15,
-                verbose=False
-            )
+            # Serialise inference to prevent concurrent threads corrupting the shared
+            # ByteTrack internal state. For a single-user deployment this lock is
+            # sufficient; multi-user deployments would need per-instance model objects.
+            with _inference_lock:
+                results = model.track(
+                    yolo_frame,
+                    tracker='bytetrack.yaml',
+                    persist=(frame_count > 0),
+                    conf=0.15,
+                    verbose=False
+                )
             
             annotated_frame = frame
             
@@ -1398,7 +1489,12 @@ def process_video_job(job_id, temp_input, temp_output, color_mapping, color_over
                     for tr in coord_tracker.tracks.values()
                 )
                 is_shot_active = any_moving or any_missing_in_zone
-                track_res = tracker.update(current_stats, potted_balls, is_shot_active=is_shot_active, any_moving=any_moving)
+                
+                # Pass a snapshot of the detection counts to the game tracker so that
+                # the tracker's read of input values and the subsequent accumulation
+                # into current_stats do not interfere with each other.
+                detection_counts = dict(current_stats)
+                track_res = tracker.update(detection_counts, potted_balls, is_shot_active=is_shot_active, any_moving=any_moving)
 
                 # Print every newly generated game action exactly once.
                 if len(tracker.action_log) > last_logged_action_idx:
@@ -1414,6 +1510,7 @@ def process_video_job(job_id, temp_input, temp_output, color_mapping, color_over
                 if has_balls or potted_balls or track_res.get('history'):
                     # Use smoothed counts for exported video stats (reduces motion-blur flicker)
                     stable_counts = tracker.get_stable_counts()
+                    # Build output counts from current_stats (accumulation dict, not mutated input)
                     stats_counts = current_stats.copy()
                     for ball_key in points.keys():
                         stats_counts[ball_key] = stable_counts.get(ball_key, current_stats.get(ball_key, 0))
@@ -1508,9 +1605,10 @@ def process_video_job(job_id, temp_input, temp_output, color_mapping, color_over
                 out.write(annotated_frame)
 
             frame_count += 1
-            jobs[job_id]['processed_frames'] = frame_count
-            if total_frames > 0:
-                jobs[job_id]['progress'] = int((frame_count / total_frames) * 100)
+            with _jobs_lock:  # Thread-safe progress update visible to polling clients.
+                jobs[job_id]['processed_frames'] = frame_count
+                if total_frames > 0:
+                    jobs[job_id]['progress'] = int((frame_count / total_frames) * 100)
 
             # Deterministic progress log cadence for long jobs.
             if frame_count % 500 == 0:
@@ -1648,21 +1746,46 @@ def start_video_predict():
         pocket_str = request.form.get('pocket_points')
         if pocket_str:
             pocket_points = json.loads(pocket_str)
-            print(f"Received {len(pocket_points)} pocket calibration points.")
-    except: pass
+            # Validate structure and numeric types before passing to the tracker.
+            if isinstance(pocket_points, list) and len(pocket_points) == 6:
+                # Validate each pocket point before passing to the tracker to
+                # prevent cryptic errors deep inside the processing pipeline.
+                for p in pocket_points:
+                    if not isinstance(p, dict) or 'x' not in p or 'y' not in p:
+                        raise ValueError(f"Invalid pocket point structure: {p}")
+                    try:
+                        float(p['x'])
+                        float(p['y'])
+                    except (TypeError, ValueError):
+                        raise ValueError(f"Pocket coordinates must be numeric: {p}")
+                print(f"Received {len(pocket_points)} pocket calibration points.")
+            else:
+                print(f"Warning: pocket_points has wrong length or type: {len(pocket_points)}")
+                pocket_points = []
+    except Exception as e:
+        print(f"Warning: Failed to parse pocket_points: {e}")
+        pocket_points = []
 
     job_id = str(uuid.uuid4())
-    jobs[job_id] = {
-        'status': 'pending',
-        'progress': 0,
-        'input_path': temp_input,
-        'output_path': temp_output,
-        'playback_path': None,
-        'created_at': time.time()
-    }
+    with _jobs_lock:  # Thread-safe job registration before the worker thread starts.
+        jobs[job_id] = {
+            'status': 'pending',
+            'progress': 0,
+            'input_path': temp_input,
+            'output_path': temp_output,
+            'playback_path': None,
+            'created_at': time.time()
+        }
     
     thread = threading.Thread(target=process_video_job, args=(job_id, temp_input, temp_output, color_mapping, color_overrides, pocket_points))
+    thread.daemon = False
     thread.start()
+    
+    # Probabilistic cleanup: approximately 1 in 10 job submissions triggers a
+    # background sweep to remove expired jobs and their associated files.
+    import random
+    if random.random() < 0.1:
+        threading.Thread(target=_cleanup_old_jobs, daemon=True).start()
     
     return jsonify({'job_id': job_id, 'status': 'started'})
 
@@ -1923,13 +2046,17 @@ def live_frame():
     yolo_frame = frame
     annotated_frame = frame.copy()
 
-    results = model.track(
-        yolo_frame,
-        tracker='bytetrack.yaml',
-        persist=(frame_count > 0),
-        conf=0.15,
-        verbose=False
-    )
+    # Serialise inference to prevent concurrent threads corrupting the shared
+    # ByteTrack internal state. For a single-user deployment this lock is
+    # sufficient; multi-user deployments would need per-instance model objects.
+    with _inference_lock:
+        results = model.track(
+            yolo_frame,
+            tracker='bytetrack.yaml',
+            persist=(frame_count > 0),
+            conf=0.15,
+            verbose=False
+        )
     
     if not results or len(results) == 0:
         return jsonify({'error': 'No tracking results'}), 500
@@ -2158,6 +2285,26 @@ def live_frame():
         'stats': track_res,
         'image': b64_img
     })
+
+
+@app.route('/live/stop', methods=['POST'])
+def live_stop():
+    """Delete a live analysis session from memory.
+
+    Expects a JSON body with:
+      - session_id : the session ID returned by /live/start
+
+    Called by the Flutter client when the user stops live tracking,
+    preventing session objects from accumulating indefinitely.
+    """
+    data = request.get_json(silent=True) or {}
+    session_id = data.get('session_id') or request.form.get('session_id')
+    if session_id and session_id in live_sessions:
+        live_sessions.pop(session_id)
+        print(f"[LIVE] Session {session_id} removed.")
+        return jsonify({'status': 'ok'})
+    return jsonify({'status': 'not_found'}), 404
+
 
 if __name__ == '__main__':
     # host='0.0.0.0' allows access from other devices on the network.
