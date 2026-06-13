@@ -33,7 +33,7 @@ try:
 except Exception as e:
     print(f"Error patching checks: {e}")
 
-from flask import Flask, request, jsonify, send_file, after_this_request, make_response
+from flask import Flask, request, jsonify, Response, stream_with_context
 from ultralytics import YOLO
 import cv2
 import numpy as np
@@ -237,6 +237,25 @@ class SnookerGameTracker:
         self.prev_shot_active_debounced = False
         self.pot_happened_this_shot = False
 
+        # foul_this_shot: set when a foul fires mid-shot. Any subsequent pot
+        # events from the same physical shot (e.g. a red ball that was potted
+        # alongside the white but whose tracking delay means it's detected a
+        # few frames later) must be ignored — they should NOT score for anyone.
+        self.foul_this_shot = False
+
+        # switch_cooldown_frames: countdown after any turn switch. While > 0
+        # the auto turn-switch is suppressed, preventing the cue ball
+        # re-spotting motion (or residual ball wobble) from immediately
+        # triggering a second spurious switch.
+        self.switch_cooldown_frames = 0
+
+        # white_moved_this_shot: True only if the cue ball was detected as
+        # Moving at some point during the current shot window. Auto turn-switch
+        # is only allowed when the cue ball actually moved — this prevents
+        # object-ball wobble, camera shake, or referee activity from being
+        # misidentified as a missed shot and triggering a spurious switch.
+        self.white_moved_this_shot = False
+
     def get_stable_counts(self):
         """Return a snapshot of the most recent ball counts used for reporting."""
         return dict(self.last_stable_counts)
@@ -245,6 +264,10 @@ class SnookerGameTracker:
         """Swap the active player and reset the current break to zero."""
         self.current_player = 2 if self.current_player == 1 else 1
         self.current_break = 0
+        # Block the auto-switch for 3 s after every turn change so that
+        # cue-ball re-spotting motion (after a foul) or residual ball wobble
+        # cannot immediately trigger a spurious second switch.
+        self.switch_cooldown_frames = int(self.fps * 3)
         msg = f"[INFO] Turn Switched: Now Player {self.current_player}"
         self.action_log.append({"type": "info", "msg": msg})
         print(msg)
@@ -349,16 +372,22 @@ class SnookerGameTracker:
             return self.color_order[:]
         return self.color_order[:self.next_clearance_target]
 
-    def update(self, current_frame_counts, potted_balls=None, is_shot_active=False, any_moving=False):
+    def update(self, current_frame_counts, potted_balls=None, is_shot_active=False, any_moving=False, white_moving=False):
         """Advance the game FSM given current ball counts, potted events, and motion state."""
         counts = (current_frame_counts or {}).copy()
         self.last_stable_counts = counts
         self.max_points_remaining = self.get_max_points_remaining()
 
+        # Track whether the cue ball moved at any point during this shot window.
+        if white_moving:
+            self.white_moved_this_shot = True
+
         # 2-second debounce: ignore tracking flicker between physical cue strokes.
+        # A new shot is only registered when the WHITE BALL (cue ball) moves —
+        # object-ball wobble or camera shake alone cannot start a shot window.
         if any_moving:
             self.frames_since_motion = 0
-            if not self.shot_active_debounced:
+            if not self.shot_active_debounced and white_moving:
                 self.shot_id += 1
                 self.shot_active_debounced = True
                 print(f"[SHOT] New physical stroke detected! Shot ID: {self.shot_id}")
@@ -374,8 +403,14 @@ class SnookerGameTracker:
         shot_just_settled  = self.prev_shot_active_debounced and not self.shot_active_debounced
         self.prev_shot_active_debounced = self.shot_active_debounced
 
+        # Count down the post-switch cooldown every frame.
+        if self.switch_cooldown_frames > 0:
+            self.switch_cooldown_frames -= 1
+
         if shot_just_started:
             self.pot_happened_this_shot = False
+            self.foul_this_shot = False        # new shot clears the foul flag
+            self.white_moved_this_shot = False  # reset cue-ball movement flag
 
         if potted_balls is None:
             potted_balls = []
@@ -395,6 +430,15 @@ class SnookerGameTracker:
 
         if any(ball == 'white-ball' for ball in potted_balls):
             self._handle_foul('white-ball', counts, reason="potted White ball")
+            # Any other balls detected as potted in the same physical shot
+            # (e.g. a red that lagged a few frames behind the white) must NOT
+            # score for anyone — the foul ends all pot-counting for this shot.
+            self.foul_this_shot = True
+            return self._result()
+
+        # If a foul already fired this shot, discard any late-arriving pot
+        # detections from the same physical sequence — they score for nobody.
+        if self.foul_this_shot:
             return self._result()
 
         if potted_balls:
@@ -476,7 +520,15 @@ class SnookerGameTracker:
 
         # Auto turn-switch: shot fully settled (2-s debounce expired) with no pot and no foul.
         # Covers both missed shots and deliberate safety shots — both end the turn in snooker.
-        if shot_just_settled and not self.pot_happened_this_shot and self.shot_id > 0:
+        # Guards:
+        #   switch_cooldown_frames == 0  → prevents re-spotting / wobble from double-switching
+        #   white_moved_this_shot        → only switch when the cue ball actually moved;
+        #                                  object-ball wobble alone cannot end a turn
+        if (shot_just_settled
+                and not self.pot_happened_this_shot
+                and self.shot_id > 0
+                and self.switch_cooldown_frames == 0
+                and self.white_moved_this_shot):
             self.switch_turn()
             msg = f"[AUTO] No pot detected — turn passed to P{self.current_player}"
             self.action_log.append({"type": "info", "msg": msg})
@@ -510,9 +562,9 @@ class BallCoordinateTracker:
         self.max_match_distance_px = float(max_match_distance_px)
         self.fps = float(fps)
         self.patience_frames = int(patience_frames)
-        # A ball must be missing for 0.8 s while its last position was in a pocket zone.
-        self.pot_frames = max(2, int(round(fps * 0.8)))  # ~0.8 s
-        self.max_missed_frames = int(max_missed_frames) if max_missed_frames is not None else self.pot_frames + max(5, int(round(fps * 0.5)))
+        # A ball must be missing for 2.0 s while its last position was in a pocket zone.
+        self.pot_frames = max(2, int(round(fps * 2.0)))  # ~2.0 s
+        self.max_missed_frames = int(max_missed_frames) if max_missed_frames is not None else self.pot_frames + max(5, int(round(fps * 1.0)))
         self.default_radius_px = float(default_radius_px)
 
         self.pocket_points_2d = []  # list of 6 (x,y) tuples; empty = uncalibrated
@@ -1484,17 +1536,21 @@ def process_video_job(job_id, temp_input, temp_output, color_mapping, color_over
                 potted_balls = coord_tracker.get_potted_balls()
 
                 any_moving = any(t.get('status') == 'Moving' for t in coordinate_mapping)
+                white_moving = any(
+                    t.get('label') == 'white-ball' and t.get('status') == 'Moving'
+                    for t in coordinate_mapping
+                )
                 any_missing_in_zone = any(
                     tr.get('in_zone', False) and 0 < tr.get('missed', 0) < coord_tracker.pot_frames
                     for tr in coord_tracker.tracks.values()
                 )
                 is_shot_active = any_moving or any_missing_in_zone
-                
+
                 # Pass a snapshot of the detection counts to the game tracker so that
                 # the tracker's read of input values and the subsequent accumulation
                 # into current_stats do not interfere with each other.
                 detection_counts = dict(current_stats)
-                track_res = tracker.update(detection_counts, potted_balls, is_shot_active=is_shot_active, any_moving=any_moving)
+                track_res = tracker.update(detection_counts, potted_balls, is_shot_active=is_shot_active, any_moving=any_moving, white_moving=white_moving)
 
                 # Print every newly generated game action exactly once.
                 if len(tracker.action_log) > last_logged_action_idx:
@@ -1868,13 +1924,35 @@ def get_job_result(job_id):
         else:
             return jsonify({'error': 'Result video file is unavailable'}), 500
 
-    # conditional=True enables HTTP range requests for seeking/scrubbing.
-    response = make_response(
-        send_file(result_video_path, mimetype='video/mp4', conditional=True)
+    # Stream file in 64 KB chunks with explicit Content-Length.
+    # Flask's send_file over Werkzeug's dev server drops connections on large
+    # binary files — a manual streaming generator is more reliable.
+    file_size = os.path.getsize(result_video_path)
+    _path = result_video_path  # capture for closure
+
+    def _generate():
+        try:
+            sent = 0
+            with open(_path, 'rb') as fh:
+                while True:
+                    chunk = fh.read(65536)
+                    if not chunk:
+                        break
+                    sent += len(chunk)
+                    yield chunk
+            print(f"[INFO] job_result {job_id}: streamed {sent}/{file_size} bytes OK")
+        except Exception as e:
+            print(f"[ERROR] job_result {job_id}: stream failed after {sent} bytes: {e}")
+
+    return Response(
+        stream_with_context(_generate()),
+        mimetype='video/mp4',
+        headers={
+            'Content-Length': str(file_size),
+            'Content-Disposition': 'inline; filename="result.mp4"',
+            'X-Snooker-Stats-Ref': job_id,
+        },
     )
-    # Keep header tiny to avoid client/header-size limits.
-    response.headers['X-Snooker-Stats-Ref'] = job_id
-    return response
 
 @app.route('/job_stats/<job_id>', methods=['GET'])
 def get_job_stats(job_id):
@@ -2233,6 +2311,10 @@ def live_frame():
     potted_balls_this_frame = coord_tracker.get_potted_balls()
     
     any_moving = any(tr.get('status') == 'Moving' for tr in active_tracks)
+    white_moving = any(
+        tr.get('label') == 'white-ball' and tr.get('status') == 'Moving'
+        for tr in active_tracks
+    )
     any_missing_in_zone = any(
         tr.get('in_zone', False) and 0 < tr.get('missed', 0) < coord_tracker.pot_frames
         for tr in coord_tracker.tracks.values()
@@ -2240,8 +2322,8 @@ def live_frame():
     is_shot_active = any_moving or any_missing_in_zone
 
     potted_balls_this_frame = [b for b in potted_balls_this_frame if str(b) != "None"]
-             
-    track_res = tracker.update(current_stats, potted_balls_this_frame, is_shot_active=is_shot_active, any_moving=any_moving)
+
+    track_res = tracker.update(current_stats, potted_balls_this_frame, is_shot_active=is_shot_active, any_moving=any_moving, white_moving=white_moving)
     stable_counts = tracker.get_stable_counts()
     
     for key in current_stats:
@@ -2307,5 +2389,14 @@ def live_stop():
 
 
 if __name__ == '__main__':
-    # host='0.0.0.0' allows access from other devices on the network.
-    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+    # Use waitress (production WSGI server) instead of Flask's dev server.
+    # Flask/Werkzeug drops connections on large binary file transfers —
+    # waitress handles concurrent requests and large responses reliably.
+    try:
+        from waitress import serve
+        print("Starting server with waitress on http://0.0.0.0:5000 ...")
+        serve(app, host='0.0.0.0', port=5000, threads=8)
+    except ImportError:
+        print("[WARN] waitress not installed. Falling back to Flask dev server.")
+        print("       Install it: pip install waitress")
+        app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False, threaded=True)

@@ -465,6 +465,7 @@ class _MyHomePageState extends State<MyHomePage> {
 
   File? _imageFile;
   bool _isImageAnalyzing = false;
+  bool _isAnalyzed = false;
   final List<Offset> _imageTapPoints = [];
   final GlobalKey _imageAnalysisKey = GlobalKey();
 
@@ -599,12 +600,23 @@ class _MyHomePageState extends State<MyHomePage> {
       _pocketPoints = tappedPoints;
     });
 
+    // Cancel any in-flight job so the old polling loop exits cleanly.
+    final prevJobId = _currentJobId;
+    if (prevJobId != null) {
+      try {
+        await http.post(Uri.parse('$serverUrl/cancel_job/$prevJobId'));
+      } catch (_) {}
+    }
+
     await _initializePlayer(file: file, isMuted: true);
     setState(() {
       _videoFile = file;
       _processedVideoFile = null;
       _isLoading = true;
       _lastVideoProcessDuration = null;
+      _currentJobId = null; // clear old job so the polling loop won't restart it
+      _counts = null;       // clear old stats so the scoreboard resets
+      _progressValue = 0.0;
     });
     _processVideo(file);
   }
@@ -830,53 +842,53 @@ class _MyHomePageState extends State<MyHomePage> {
           }
         }
 
-        print("Job completed. Loading network stream...");
+        print("Job completed. Downloading result video...");
         final resultUrl = '$serverUrl/job_result/$jobId';
         lastRequestUrl = resultUrl;
 
+        // Always download to a local file first. Streaming the result directly
+        // from Flask's dev server via VideoPlayerController.networkUrl() causes
+        // "Connection closed while receiving data" because the Android video
+        // player fires multiple concurrent HTTP range requests that the dev
+        // server cannot handle reliably.
+        final appDir = await getApplicationDocumentsDirectory();
+        final processedDir = Directory('${appDir.path}${Platform.pathSeparator}processed_videos');
+        if (!await processedDir.exists()) {
+          await processedDir.create(recursive: true);
+        }
+        final localResultPath =
+            '${processedDir.path}${Platform.pathSeparator}snooker_result_${DateTime.now().millisecondsSinceEpoch}.mp4';
+        final localResultFile = File(localResultPath);
+
+        final client = http.Client();
         try {
-          await _initializePlayer(networkUrl: resultUrl);
-        } catch (networkInitError) {
-          print('Network video init failed, falling back to local file: $networkInitError');
-
-          lastRequestUrl = resultUrl;
-          final appDir = await getApplicationDocumentsDirectory();
-          final processedDir = Directory('${appDir.path}${Platform.pathSeparator}processed_videos');
-          if (!await processedDir.exists()) {
-            await processedDir.create(recursive: true);
+          final req = http.Request('GET', Uri.parse(resultUrl));
+          final resp = await client.send(req);
+          if (resp.statusCode != 200) {
+            final body = await resp.stream.bytesToString();
+            throw Exception('Server returned ${resp.statusCode}: $body');
           }
-          final localResultPath =
-              '${processedDir.path}${Platform.pathSeparator}snooker_result_${DateTime.now().millisecondsSinceEpoch}.mp4';
-          final localResultFile = File(localResultPath);
+          final sink = localResultFile.openWrite();
+          await resp.stream.pipe(sink);
+          await sink.close();
+        } finally {
+          client.close();
+        }
 
-          final client = http.Client();
-          try {
-            final req = http.Request('GET', Uri.parse(resultUrl));
-            final resp = await client.send(req);
-            if (resp.statusCode != 200) {
-              throw Exception(
-                'Failed to load processed video. '
-                'Network init error: $networkInitError; '
-                'Download status: ${resp.statusCode}',
-              );
-            }
+        if (!await localResultFile.exists() || await localResultFile.length() == 0) {
+          throw Exception('Downloaded result video is empty or missing.');
+        }
 
-            final sink = localResultFile.openWrite();
-            await resp.stream.pipe(sink);
-            await sink.close();
-          } finally {
-            client.close();
-          }
-
-          if (!await localResultFile.exists() || await localResultFile.length() == 0) {
-            throw Exception(
-              'Failed to load processed video. '
-              'Network init error: $networkInitError; '
-              'Downloaded file is empty.',
-            );
-          }
-
+        try {
           await _initializePlayer(file: localResultFile);
+        } on PlatformException catch (e) {
+          // Codec/playback error — file downloaded but Android can't decode it.
+          // Usually means the server didn't transcode to H.264 (ffmpeg missing).
+          throw Exception(
+            'Video downloaded but cannot be played.\n'
+            'Ensure the server has ffmpeg installed (pip install imageio imageio-ffmpeg).\n\n'
+            'Player error: ${e.message}',
+          );
         }
 
         if (mounted) {
@@ -1574,6 +1586,7 @@ class _MyHomePageState extends State<MyHomePage> {
     PaintingBinding.instance.imageCache.clearLiveImages();
     setState(() {
       _imageFile = File(pickedFile.path);
+      _isAnalyzed = false;
       _imageTapPoints.clear();
       _redShots.clear();
       _colorShots.clear();
@@ -1583,9 +1596,7 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   void _onImageAnalysisTap(TapUpDetails details) {
-    if (_imageFile == null ||
-        (_redShots.isNotEmpty || _colorShots.isNotEmpty) ||
-        _isImageAnalyzing) return;
+    if (_imageFile == null || _isAnalyzed || _isImageAnalyzing) return;
     if (_imageTapPoints.length >= 4) return;
 
     final box = _imageAnalysisKey.currentContext?.findRenderObject() as RenderBox?;
@@ -1603,7 +1614,7 @@ class _MyHomePageState extends State<MyHomePage> {
 
   String _getImagePromptText() {
     if (_imageFile == null) return 'Please select an image\nto begin tactical analysis.';
-    if (_redShots.isNotEmpty || _colorShots.isNotEmpty) return 'Tactical Analysis Complete';
+    if (_isAnalyzed) return 'Tactical Analysis Complete';
     switch (_imageTapPoints.length) {
       case 0: return '📍 Step 1: Tap TOP-LEFT corner';
       case 1: return '📍 Step 2: Tap TOP-RIGHT corner';
@@ -1657,7 +1668,7 @@ class _MyHomePageState extends State<MyHomePage> {
           TextButton(
             onPressed: () {
               Navigator.of(ctx).pop();
-              if (_redShots.isEmpty && _colorShots.isEmpty) {
+              if (!_isAnalyzed) {
                 setState(() {
                   _imageTapPoints.clear();
                   _lastRelativeCorners = null;
@@ -1706,6 +1717,7 @@ class _MyHomePageState extends State<MyHomePage> {
           _redShots = body['red_shots'] ?? [];
           _colorShots = body['color_shots'] ?? [];
           _imageTapPoints.clear();
+          _isAnalyzed = true;
         });
       } else {
         _showImageErrorDialog((body['message'] ?? 'Shot analysis failed').toString());
@@ -1727,13 +1739,10 @@ class _MyHomePageState extends State<MyHomePage> {
 
   Widget _buildImageDashboard() {
     final currentShots = _getCurrentImageShots();
-    if (currentShots.isEmpty) return const SizedBox.shrink();
-
-    final String message = currentShots[0]['message']?.toString() ?? '';
     final String ballLabel = _currentTargetType == 'red' ? 'Red' : 'Colour';
 
-    // Case: no balls of this type were detected by YOLO
-    if (message == 'no_balls_detected') {
+    // Case: engine returned [] — no balls of this type detected on the table
+    if (currentShots.isEmpty) {
       return Card(
         margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
         elevation: 4,
@@ -1755,6 +1764,8 @@ class _MyHomePageState extends State<MyHomePage> {
         ),
       );
     }
+
+    final String message = currentShots[0]['message']?.toString() ?? '';
 
     // Case: balls exist but every attack path is blocked (snookered / obstructed)
     if (message == 'all_paths_blocked') {
@@ -1979,7 +1990,7 @@ class _MyHomePageState extends State<MyHomePage> {
                 key: _imageAnalysisKey,
                 children: [
                   imageContent,
-                  if (_redShots.isEmpty && _colorShots.isEmpty)
+                  if (!_isAnalyzed)
                     ..._imageTapPoints.map((point) => Positioned(
                           left: point.dx - 8,
                           top: point.dy - 8,

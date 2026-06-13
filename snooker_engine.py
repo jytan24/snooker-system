@@ -49,7 +49,7 @@ def find_best_pocket_and_score(target_pos, white_pos, all_balls_warped):
         if norm_w2r == 0 or norm_r2p == 0: continue
         cos_a = max(-1.0, min(1.0, np.dot(vec_w2r, vec_r2p) / (norm_w2r * norm_r2p))) 
         angle = math.degrees(math.acos(cos_a))
-        if angle > 85: continue 
+        if angle > MAX_ANGLE: continue 
         unit_p2r = vec_r2p / norm_r2p
         gh_warped = (target_pos[0] - BALL_RADIUS_WARPED*2*unit_p2r[0], target_pos[1] - BALL_RADIUS_WARPED*2*unit_p2r[1])
         if is_path_blocked(white_pos, gh_warped, all_balls_warped, [white_pos, target_pos]): continue
@@ -73,7 +73,7 @@ def analyze_snooker_image(image_path, corner_points, output_prefix="res"):
     img_orig = cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
     if img_orig is None: return {"status": "error", "message": "Decode failed"}
 
-    # Resize to max 800px — sufficient for YOLO and much lighter for network transfer.
+    # Compression for speed and bandwidth
     MAX_DIM = 800
     h, w = img_orig.shape[:2]
     if max(h, w) > MAX_DIM:
@@ -88,6 +88,7 @@ def analyze_snooker_image(image_path, corner_points, output_prefix="res"):
 
     results = model.predict(source=img_orig, conf=0.3, verbose=False)[0]
     white_warp, white_orig = None, None
+    best_white_conf = -1.0 # Track highest confidence white ball to avoid false detections from glare
     reds, colors = [], []
     all_balls_warp = []
     COLOR_BALL_CLASSES = ['yellow-ball', 'green-ball', 'brown-ball', 'blue-ball', 'pink-ball', 'black-ball']
@@ -95,27 +96,34 @@ def analyze_snooker_image(image_path, corner_points, output_prefix="res"):
     for box in results.boxes:
         cx, cy = float(box.xywh[0][0]), float(box.xywh[0][1])
         cls = results.names[int(box.cls[0])]
+        conf = float(box.conf[0]) # Confidence score for this detection
+        
         pw = cv2.perspectiveTransform(np.array([[[cx, cy]]], dtype=np.float32), M)[0][0]
         wx, wy = float(pw[0]), float(pw[1])
         all_balls_warp.append((wx, wy))
-        if cls == 'white-ball': white_orig, white_warp = (int(cx), int(cy)), (wx, wy)
-        elif cls == 'red-ball': reds.append({'orig': (int(cx), int(cy)), 'warp': (wx, wy)})
-        elif cls in COLOR_BALL_CLASSES: colors.append({'orig': (int(cx), int(cy)), 'warp': (wx, wy)})
+        
+        if cls == 'white-ball': 
+            # Only update white ball position if this detection has higher confidence (prevents glare override)
+            if conf > best_white_conf:
+                white_orig, white_warp = (int(cx), int(cy)), (wx, wy)
+                best_white_conf = conf
+        elif cls == 'red-ball': 
+            reds.append({'orig': (int(cx), int(cy)), 'warp': (wx, wy)})
+        elif cls in COLOR_BALL_CLASSES: 
+            colors.append({'orig': (int(cx), int(cy)), 'warp': (wx, wy)})
 
-    # Free GPU memory immediately after inference to prevent CUDA/DirectML memory buildup.
     del results
     import torch
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    if not white_orig: return {"status": "error", "message": "Cue ball missing"}
+    # ERROR: No Cue Ball
+    if not white_orig: return {"status": "error", "message": "Cue ball missing! System cannot find the white ball."}
 
     def process_group(targets, t_type):
-        # Case 1: No balls of this type detected by YOLO
+        # ERROR: No target balls found on the table
         if not targets:
-            path = f"{output_prefix}_{t_type}_none.jpg"
-            cv2.imwrite(path, img_orig.copy(), [int(cv2.IMWRITE_JPEG_QUALITY), 65])
-            return [{'rank': 1, 'difficulty': 'N/A', 'message': 'no_balls_detected', 'image_path': path}]
+            return [] # Returning empty triggers the Flutter "No Balls Detected" UI
 
         valid = []
         for i, t in enumerate(targets):
@@ -123,41 +131,61 @@ def analyze_snooker_image(image_path, corner_points, output_prefix="res"):
             if pkt:
                 pct = min(100.0, (score / THEORETICAL_MAX_SCORE) * 100.0)
                 valid.append({'score': score, 'pct': pct, 'target': t, 'pocket': pkt})
-
-        # Case 2: Balls exist but all attack paths are blocked (snookered / obstructed)
-        if not valid:
-            nearest = min(targets, key=lambda t: calculate_distance(white_warp, t['warp']))
+        
+        # ====================================================================
+        # SNOOKERED FALLBACK LOGIC (All attacking paths are blocked)
+        # ====================================================================
+        if not valid and len(targets) > 0:
+            # 1. Find the closest ball of this type to the cue ball
+            closest_target = None
+            min_distance = float('inf')
+            
+            for t in targets:
+                dist = calculate_distance(white_warp, t['warp'])
+                if dist < min_distance:
+                    min_distance = dist
+                    closest_target = t
+            
+            # 2. Draw a safety line directly to this closest ball
             img_draw = img_orig.copy()
-            # Draw a direct dashed line from white to nearest ball as safety suggestion
-            draw_dashed_line(img_draw, white_orig, nearest['orig'], (0, 165, 255), 2)  # orange
-            cv2.circle(img_draw, nearest['orig'], int(BALL_RADIUS_WARPED * 1.5), (0, 165, 255), 2)
-            path = f"{output_prefix}_{t_type}_blocked.jpg"
+            # Draw an Orange dashed line indicating a defensive shot
+            draw_dashed_line(img_draw, white_orig, closest_target['orig'], (0, 165, 255), 2)
+            # Highlight the target ball
+            cv2.circle(img_draw, closest_target['orig'], int(BALL_RADIUS_WARPED * 1.5), (0, 0, 255), 2)
+            
+            path = f"{output_prefix}_{t_type}_safety.jpg"
             cv2.imwrite(path, img_draw, [int(cv2.IMWRITE_JPEG_QUALITY), 65])
+            
+            # 3. Return a special response with 'N/A' difficulty and a 'snookered' message
+            # Flutter will see 'N/A' and trigger the Orange Dashboard!
             return [{'rank': 1, 'difficulty': 'N/A', 'message': 'all_paths_blocked', 'image_path': path}]
 
+        # ====================================================================
+        # NORMAL ATTACKING SHOT LOGIC
+        # ====================================================================
         valid.sort(key=lambda x: x['score'])
         res_list = []
         for rank, shot in enumerate(valid[:3]):
             img_draw = img_orig.copy()
-
+            
             v_p2r = np.array([shot['target']['warp'][0]-shot['pocket'][0], shot['target']['warp'][1]-shot['pocket'][1]])
             u_p2r = v_p2r / np.linalg.norm(v_p2r)
             gh_w = (shot['target']['warp'][0] + BALL_RADIUS_WARPED*2*u_p2r[0], shot['target']['warp'][1] + BALL_RADIUS_WARPED*2*u_p2r[1])
-
+            
             gh_o = cv2.perspectiveTransform(np.array([[[gh_w[0], gh_w[1]]]], dtype=np.float32), M_INV)[0][0]
             pkt_o = cv2.perspectiveTransform(np.array([[[shot['pocket'][0], shot['pocket'][1]]]], dtype=np.float32), M_INV)[0][0]
-
+            
             gh_orig_pt = (int(gh_o[0]), int(gh_o[1]))
             target_orig_pt = shot['target']['orig']
             pkt_orig_pt = (int(pkt_o[0]), int(pkt_o[1]))
-
+            
             draw_dashed_line(img_draw, white_orig, gh_orig_pt, (255,255,255), 2)
             draw_dashed_line(img_draw, target_orig_pt, pkt_orig_pt, (0,255,255), 2)
             cv2.circle(img_draw, gh_orig_pt, int(BALL_RADIUS_WARPED * 1.5), (0, 0, 255), 2)
-
+            
             path = f"{output_prefix}_{t_type}_{rank+1}.jpg"
             cv2.imwrite(path, img_draw, [int(cv2.IMWRITE_JPEG_QUALITY), 65])
-            res_list.append({'rank': rank+1, 'difficulty': f"{shot['pct']:.1f}%", 'message': 'ok', 'target_id': '?', 'image_path': path})
+            res_list.append({'rank': rank+1, 'difficulty': f"{shot['pct']:.1f}%", 'message': 'clear_path', 'image_path': path})
         return res_list
 
     return {

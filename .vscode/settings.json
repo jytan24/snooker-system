@@ -1,3 +1,9 @@
 {
-    "python.analysis.typeCheckingMode": "off"
+    "python.analysis.typeCheckingMode": "off",
+    "cmake.ignoreCMakeListsMissing": true,
+    "java.import.gradle.enabled": false,
+    "files.watcherExclude": {
+        "**/.dart_tool/**": true,
+        "**/build/**": true
+    }
 }
