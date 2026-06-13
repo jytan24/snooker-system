@@ -10,12 +10,15 @@ A snooker ball detection and analysis system built with a Python/Flask backend (
 snooker-system/
 ├── server.py            # Flask backend — detection, tracking, video processing
 ├── snooker_engine.py    # Core snooker logic (ball tracking, potting detection)
-├── app.py               # App entry point (alternative runner)
+├── app.py               # Alternative/older backend runner
 ├── requirements.txt     # Python dependencies
-├── data_v2.yaml         # YOLO dataset config
+├── yolo11s.onnx         # YOLO model weights (ONNX format)
+├── data_v2.yaml         # YOLO dataset config (for training)
 ├── train_v2.py          # Model training script
+├── train_script.py      # Training helper script
+├── predict.py           # Standalone prediction script
 ├── flutter_app/         # Flutter frontend (Android, iOS, Windows)
-└── datasets/            # Training images and labels (optional)
+└── datasets/            # Training images and labels
 ```
 
 ---
@@ -25,7 +28,6 @@ snooker-system/
 ### Backend
 - Python 3.10 or later
 - FFmpeg installed and available on your system PATH ([download here](https://ffmpeg.org/download.html))
-- YOLO model file: `yolo11s.onnx` (not included in repo — see step 3 below)
 
 ### Frontend
 - [Flutter SDK](https://docs.flutter.dev/get-started/install) 3.0.0 or later
@@ -62,18 +64,7 @@ pip install -r requirements.txt
 
 > **Note:** The `requirements.txt` includes `onnxruntime-directml` for AMD GPU acceleration on Windows. If you are on macOS or Linux (or do not have an AMD GPU), replace `onnxruntime-directml` with `onnxruntime` before installing.
 
-### 4. Add the YOLO model file
-
-The model file is not included in the repository due to its size. Place your `yolo11s.onnx` file in the project root:
-
-```
-snooker-system/
-└── yolo11s.onnx   ← place it here
-```
-
-You can download a pretrained YOLO model from [Ultralytics](https://docs.ultralytics.com/models/yolo11/) or use your own trained weights exported to ONNX format.
-
-### 5. Add Firebase credentials
+### 4. Add Firebase credentials
 
 The backend requires a Firebase service account key. Download it from your [Firebase Console](https://console.firebase.google.com/) under **Project Settings → Service Accounts → Generate new private key**, then save it as:
 
@@ -82,7 +73,7 @@ snooker-system/
 └── firebase-key.json   ← place it here
 ```
 
-### 6. Start the backend server
+### 5. Start the backend server
 
 ```bash
 python server.py
@@ -175,4 +166,3 @@ The app uses Firebase for authentication and match history. To connect it to you
 | App cannot connect to server | Make sure server is running and `SERVER_URL` points to the correct IP |
 | FFmpeg not found | Install FFmpeg and ensure it is on your system PATH |
 | Firebase auth errors | Check that `firebase-key.json` is present and `google-services.json` is configured |
-| Model not found error | Ensure `yolo11s.onnx` is placed in the project root |
