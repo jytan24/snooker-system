@@ -20,6 +20,10 @@ new_test_images/
 # Large model files
 *.onnx
 
+# Project-specific excludes
+test.py
+fyp_code.code-workspace
+
 # Flutter build artifacts
 flutter_app/build/
 flutter_app/.dart_tool/
