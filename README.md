@@ -82,7 +82,7 @@ The app uses two Flask servers — run both in separate terminals:
 python server.py
 ```
 
-**Terminal 2 — Image detection server:**
+**Terminal 2 — Image detection server (port 5001):**
 ```bash
 python app.py
 ```
