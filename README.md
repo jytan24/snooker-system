@@ -8,9 +8,9 @@ A snooker ball detection and analysis system built with a Python/Flask backend (
 
 ```
 snooker-system/
-├── server.py            # Flask backend — detection, tracking, video processing
+├── server.py            # Flask backend — video upload, tracking, video processing
 ├── snooker_engine.py    # Core snooker logic (ball tracking, potting detection)
-├── app.py               # Alternative/older backend runner
+├── app.py               # Flask backend — image detection
 ├── requirements.txt     # Python dependencies
 ├── yolo11s.onnx         # YOLO model weights (ONNX format)
 ├── data_v2.yaml         # YOLO dataset config (for training)
@@ -73,16 +73,18 @@ snooker-system/
 └── firebase-key.json   ← place it here
 ```
 
-### 5. Start the backend server
+### 5. Start the backend servers
 
+The app uses two Flask servers — run both in separate terminals:
+
+**Terminal 1 — Video processing server (port 5000):**
 ```bash
 python server.py
 ```
 
-The server runs on `http://0.0.0.0:5000`. You should see:
-
-```
-Serving on http://0.0.0.0:5000
+**Terminal 2 — Image detection server:**
+```bash
+python app.py
 ```
 
 ---
@@ -150,7 +152,7 @@ The app uses Firebase for authentication and match history. To connect it to you
 
 ## Usage
 
-1. Start the backend server (`python server.py`).
+1. Start both backend servers (`python server.py` and `python app.py`) in separate terminals.
 2. Launch the Flutter app on your device or emulator.
 3. Log in or register an account.
 4. Use **Live Camera** to detect snooker balls in real time, or **Upload Video** to analyse a recorded match.
